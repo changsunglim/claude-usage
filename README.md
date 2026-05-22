@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE)
 [![claude-code](https://img.shields.io/badge/claude--code-black?style=flat-square)](https://claude.ai/code)
 
-> **Fork notice:** This is a fork of [phuryn/claude-usage](https://github.com/phuryn/claude-usage) with added features:
+> **Fork notice:** This is an unofficial fork of [phuryn/claude-usage](https://github.com/phuryn/claude-usage). Not affiliated with Anthropic. See [DISCLAIMER.md](DISCLAIMER.md). Added features:
 > - Live limits widget (weekly stacked bar, per-model breakdown, plan auto-detect)
 > - Session Health card with new-session recommendations
 > - Multi-metric Token Efficiency grader (Cache Hit + Reuse Ratio + Output Discipline + Cost Efficiency)
