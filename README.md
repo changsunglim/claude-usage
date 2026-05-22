@@ -3,6 +3,16 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE)
 [![claude-code](https://img.shields.io/badge/claude--code-black?style=flat-square)](https://claude.ai/code)
 
+> **Fork notice:** This is a fork of [phuryn/claude-usage](https://github.com/phuryn/claude-usage) with added features:
+> - Live limits widget (weekly stacked bar, per-model breakdown, plan auto-detect)
+> - Session Health card with new-session recommendations
+> - Multi-metric Token Efficiency grader (Cache Hit + Reuse Ratio + Output Discipline + Cost Efficiency)
+> - Per-message live session view (click row → see each prompt with token totals)
+> - Session titles extracted from first user prompt (replaces opaque project IDs)
+> - Local timezone auto-detect (was UTC-only)
+> - Noise filter: skill invocations / system reminders excluded from live view
+> - Bug fix: `cutoff` → `start`/`end` ReferenceError that killed charts
+
 **Pro and Max subscribers get a progress bar. This gives you the full picture.**
 
 Claude Code writes detailed usage logs locally — token counts, models, sessions, projects — regardless of your plan. This dashboard reads those logs and turns them into charts and cost estimates. Works on API, Pro, and Max plans.
@@ -119,10 +129,62 @@ Costs are calculated using **Anthropic API pricing as of April 2026** ([claude.c
 
 ---
 
+## Fork features
+
+### Live limits widget
+Top banner shows a **weekly all-models stacked bar** (Opus orange, Sonnet blue, Haiku green) with per-model breakdown beneath: `opus X% · 5.5M  sonnet Y% · 550k  haiku Z%`.
+
+Plan auto-detection order:
+1. macOS keychain → OAuth token → `api.anthropic.com/api/oauth/profile` (undocumented, may return None)
+2. `CLAUDE_USAGE_PLAN` env var
+3. Default `pro`
+
+Plan budgets (approximate — Anthropic does not publish exact caps):
+
+| Plan | Session 5h tokens | Weekly all-models |
+|------|-------------------|-------------------|
+| `pro` | 613k | 23M |
+| `max_5x` | 3.07M | 115M |
+| `max_20x` | 12.26M | 460M |
+
+Override via `CLAUDE_USAGE_PLAN=max_5x python cli.py dashboard` or `/api/limits?plan=max_5x`.
+
+Cache-read tokens weighted `0.1×` in billable totals to match Anthropic's cost-equivalent counting (~25% deviation in calibration).
+
+### Session Health card
+Heuristic warnings — "start new session" surfaces when any of:
+- Context > 150k tokens
+- Cache hit rate < 40%
+- Avg > 60k tokens/turn
+- Session age > 3h
+
+States: `ok` / `info` / `warn` with colored border.
+
+### Token Efficiency grader
+A/B/C/D grade from weighted formula:
+- Cache Hit 40%
+- Reuse Ratio 25%
+- Cost Efficiency 20%
+- Output Discipline 15%
+
+`?` info button in chart header reveals the formula. Recalcs every 30s with `/api/data`, respects date-range filter.
+
+### Per-message live view
+Click any session row → polls `/api/session/<id>` every 5s. Each user prompt shows token totals (input / output / cache_read / cache_creation), model, turn count, and tools used. Skill invocations and system reminders are filtered out so the list shows real human turns only.
+
+### New endpoints
+- `GET /api/limits?plan=<pro|max_5x|max_20x>` — weekly + session 5h budgets, plan, used/remaining
+- `GET /api/session/<id>` — per-message breakdown for a session
+
+Server uses `ThreadingHTTPServer` so concurrent `/api/data` + `/api/limits` calls don't block.
+
+---
+
 ## Files
 
 | File | Purpose |
 |------|---------|
 | `scanner.py` | Parses JSONL transcripts, writes to `~/.claude/usage.db` |
 | `dashboard.py` | HTTP server + single-page HTML/JS dashboard |
+| `limits.py` | Plan detection, session 5h window, rolling weekly budgets |
 | `cli.py` | `scan`, `today`, `stats`, `dashboard` commands |
