@@ -213,6 +213,7 @@ def get_dashboard_data(db_path=DB_PATH):
             "branch":        r["git_branch"] or "",
             "last":          last_shifted[:16].replace("T", " "),
             "last_date":     last_shifted[:10],
+            "last_iso":      r["last_timestamp"],
             "duration_min":  duration_min,
             "model":         r["model"] or "unknown",
             "turns":         r["turn_count"] or 0,
@@ -549,7 +550,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 </div>
 <div id="limits-banner">
   <div class="limit-card" id="lc-weekly">
-    <div class="lc-head"><span id="lc-weekly-title">Usage · All Models</span><span class="lc-pct">—</span></div>
+    <div class="lc-head"><span>Weekly · All Models</span><span class="lc-pct">—</span></div>
     <div class="lc-bar"><div class="lc-fill"></div></div>
     <div class="lc-foot"><span class="lc-used">— / —</span><span class="lc-reset" id="lc-weekly-reset">—</span></div>
     <div class="lc-models" id="lc-weekly-models"></div>
@@ -559,34 +560,18 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         Sync reset to now
       </button>
       <button id="lc-weekly-edit" class="filter-btn" style="padding:2px 8px;font-size:11px;margin-left:4px"
-        title="Manually edit anchor, percent, and window length.">
+        title="Manually edit anchor time and current percent if you missed the sync moment.">
         Edit…
       </button>
       <button id="lc-weekly-clear" class="filter-btn" style="padding:2px 8px;font-size:11px;margin-left:4px"
-        title="Clear manual override and return to auto-detection (7d window).">
+        title="Clear manual override and return to auto-detection.">
         Clear
       </button>
       <div id="lc-weekly-edit-form" style="display:none;margin-top:6px;padding:6px;border:1px solid #2a3142;border-radius:4px">
-        <label style="display:block;margin-bottom:4px">Window length:
-          <select id="lc-weekly-window-preset" style="background:#1a1f2c;color:#e8ecf3;border:1px solid #2a3142;padding:2px 4px;font-size:11px">
-            <option value="1800">30 min</option>
-            <option value="3600">1 h</option>
-            <option value="10800">3 h</option>
-            <option value="21600">6 h</option>
-            <option value="43200">12 h</option>
-            <option value="86400">1 d</option>
-            <option value="259200">3 d</option>
-            <option value="604800" selected>7 d</option>
-            <option value="custom">Custom (minutes)…</option>
-          </select>
-          <input id="lc-weekly-window-custom" type="number" min="30" max="10080" step="1" placeholder="mins"
-            style="display:none;margin-left:6px;width:70px;background:#1a1f2c;color:#e8ecf3;border:1px solid #2a3142;padding:2px 4px;font-size:11px">
-          <span style="margin-left:6px;opacity:0.6">cap scales proportionally</span>
-        </label>
-        <label style="display:block;margin-bottom:4px">Anchor (window start):
+        <label style="display:block;margin-bottom:4px">Anchor (last reset time):
           <input id="lc-weekly-anchor-input" type="datetime-local" style="background:#1a1f2c;color:#e8ecf3;border:1px solid #2a3142;padding:2px 4px;font-size:11px">
         </label>
-        <label style="display:block;margin-bottom:4px">% used right NOW: <span style="opacity:0.6">(Enter=save, Esc=cancel)</span>
+        <label style="display:block;margin-bottom:4px">% shown in Claude Settings right NOW (Enter=save, Esc=cancel):
           <input id="lc-weekly-percent-input" type="number" min="0" max="100" step="0.1" placeholder="0" style="width:60px;background:#1a1f2c;color:#e8ecf3;border:1px solid #2a3142;padding:2px 4px;font-size:11px">
         </label>
         <button id="lc-weekly-save" class="filter-btn" style="padding:2px 8px;font-size:11px">Save</button>
@@ -617,6 +602,21 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <button class="range-btn" data-range="30d" onclick="setRange('30d')">30d</button>
     <button class="range-btn" data-range="90d" onclick="setRange('90d')">90d</button>
     <button class="range-btn" data-range="all" onclick="setRange('all')">All</button>
+    <button class="range-btn" data-range="custom" onclick="openCustomRange()"
+      title="Filter the whole dashboard to a custom rolling window (minutes/hours/days back from now).">Custom…</button>
+  </div>
+  <div id="custom-range-panel" style="display:none;margin-left:10px;padding:4px 8px;border:1px solid var(--border);border-radius:4px;background:rgba(255,255,255,0.03)">
+    <span style="font-size:11px;opacity:0.7;margin-right:6px">Last</span>
+    <input id="custom-range-amount" type="number" min="1" max="10080" step="1" value="60"
+      style="width:60px;background:#1a1f2c;color:#e8ecf3;border:1px solid #2a3142;padding:2px 4px;font-size:11px">
+    <select id="custom-range-unit"
+      style="background:#1a1f2c;color:#e8ecf3;border:1px solid #2a3142;padding:2px 4px;font-size:11px;margin-left:4px">
+      <option value="m">minutes</option>
+      <option value="h" selected>hours</option>
+      <option value="d">days</option>
+    </select>
+    <button class="filter-btn" style="padding:2px 8px;font-size:11px;margin-left:6px" onclick="applyCustomRange()">Apply</button>
+    <span style="font-size:10px;opacity:0.55;margin-left:8px">Sub-day windows filter sessions by last activity (session-level precision).</span>
   </div>
 </div>
 
@@ -888,9 +888,32 @@ const MODEL_COLORS = ['#d97757','#4f8ef7','#4ade80','#a78bfa','#fbbf24','#f472b6
 const RANGE_LABELS = { 'week': 'This Week', 'month': 'This Month', 'prev-month': 'Previous Month', '7d': 'Last 7 Days', '30d': 'Last 30 Days', '90d': 'Last 90 Days', 'all': 'All Time' };
 const RANGE_TICKS  = { 'week': 7, 'month': 15, 'prev-month': 15, '7d': 7, '30d': 15, '90d': 13, 'all': 12 };
 const VALID_RANGES = Object.keys(RANGE_LABELS);
+// Custom range stored as 'custom:<minutes>'. Default 60 min.
+let customRangeMinutes = 60;
+
+function isCustomRange(r) { return typeof r === 'string' && r.startsWith('custom:'); }
+function customRangeFromKey(r) {
+  if (!isCustomRange(r)) return null;
+  const n = parseInt(r.slice(7), 10);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+function fmtCustomLabel(mins) {
+  if (mins < 60) return `Last ${mins} min`;
+  if (mins < 1440) {
+    const h = mins / 60;
+    return `Last ${Number.isInteger(h) ? h : h.toFixed(1)} h`;
+  }
+  const d = mins / 1440;
+  return `Last ${Number.isInteger(d) ? d : d.toFixed(1)} d`;
+}
+function rangeLabel(range) {
+  if (isCustomRange(range)) return fmtCustomLabel(customRangeFromKey(range) || 60);
+  return RANGE_LABELS[range] || range;
+}
 
 function rangeIncludesToday(range) {
   if (range === 'all') return true;
+  if (isCustomRange(range)) return true;  // custom always ends at now
   const { start, end } = getRangeBounds(range);
   const today = new Date().toISOString().slice(0, 10);
   if (start && today < start) return false;
@@ -899,30 +922,59 @@ function rangeIncludesToday(range) {
 }
 
 function getRangeBounds(range) {
-  if (range === 'all') return { start: null, end: null };
+  if (range === 'all') return { start: null, end: null, startMs: null, endMs: null };
   const today = new Date();
   const iso = d => d.toISOString().slice(0, 10);
+  if (isCustomRange(range)) {
+    const mins = customRangeFromKey(range) || 60;
+    const endMs = Date.now();
+    const startMs = endMs - mins * 60 * 1000;
+    const startDate = new Date(startMs);
+    return {
+      start: iso(startDate),
+      end: null,
+      startMs: startMs,
+      endMs: endMs,
+    };
+  }
   if (range === 'week') {
     const day = today.getDay();
     const diffToMon = day === 0 ? 6 : day - 1;
     const mon = new Date(today); mon.setDate(today.getDate() - diffToMon);
     const sun = new Date(mon); sun.setDate(mon.getDate() + 6);
-    return { start: iso(mon), end: iso(sun) };
+    return { start: iso(mon), end: iso(sun), startMs: null, endMs: null };
   }
   if (range === 'month') {
     const start = new Date(today.getFullYear(), today.getMonth(), 1);
     const end = new Date(today.getFullYear(), today.getMonth() + 1, 0);
-    return { start: iso(start), end: iso(end) };
+    return { start: iso(start), end: iso(end), startMs: null, endMs: null };
   }
   if (range === 'prev-month') {
     const start = new Date(today.getFullYear(), today.getMonth() - 1, 1);
     const end = new Date(today.getFullYear(), today.getMonth(), 0);
-    return { start: iso(start), end: iso(end) };
+    return { start: iso(start), end: iso(end), startMs: null, endMs: null };
   }
   const days = range === '7d' ? 7 : range === '30d' ? 30 : 90;
   const d = new Date();
   d.setDate(d.getDate() - days);
-  return { start: iso(d), end: null };
+  return { start: iso(d), end: null, startMs: null, endMs: null };
+}
+
+function openCustomRange() {
+  const panel = document.getElementById('custom-range-panel');
+  if (!panel) return;
+  panel.style.display = '';
+  const amt = document.getElementById('custom-range-amount');
+  if (amt) amt.focus();
+}
+function applyCustomRange() {
+  const amt = parseInt(document.getElementById('custom-range-amount').value, 10);
+  const unit = document.getElementById('custom-range-unit').value;
+  if (!Number.isFinite(amt) || amt < 1) { alert('Enter a positive number.'); return; }
+  const mins = unit === 'd' ? amt * 1440 : unit === 'h' ? amt * 60 : amt;
+  if (mins > 525600) { alert('Max is 1 year.'); return; }
+  customRangeMinutes = mins;
+  setRange('custom:' + mins);
 }
 
 // Number of calendar days the selected range spans (used as denominator
@@ -941,14 +993,23 @@ function rangeCalendarDays(range, startISO, endISO) {
 
 function readURLRange() {
   const p = new URLSearchParams(window.location.search).get('range');
+  if (p && isCustomRange(p) && customRangeFromKey(p)) {
+    customRangeMinutes = customRangeFromKey(p);
+    return p;
+  }
   return VALID_RANGES.includes(p) ? p : '30d';
 }
 
 function setRange(range) {
   selectedRange = range;
-  document.querySelectorAll('.range-btn').forEach(btn =>
-    btn.classList.toggle('active', btn.dataset.range === range)
-  );
+  const isCustom = isCustomRange(range);
+  document.querySelectorAll('.range-btn').forEach(btn => {
+    const target = isCustom ? 'custom' : range;
+    btn.classList.toggle('active', btn.dataset.range === target);
+  });
+  // Show/hide custom panel based on whether range is custom.
+  const panel = document.getElementById('custom-range-panel');
+  if (panel) panel.style.display = isCustom ? '' : 'none';
   updateURL();
   applyFilter();
   scheduleAutoRefresh();
@@ -1073,7 +1134,10 @@ function sortSessions(sessions) {
 function applyFilter() {
   if (!rawData) return;
 
-  const { start, end } = getRangeBounds(selectedRange);
+  const { start, end, startMs, endMs } = getRangeBounds(selectedRange);
+  // Sub-day custom range: daily rows are day-bucketed, so we filter sessions
+  // by minute-precision last_iso and recompute by-model totals from sessions.
+  const subDay = startMs != null && (endMs - startMs) < 86400000;
 
   // Filter daily rows by model + date range
   const filteredDaily = rawData.daily_by_model.filter(r =>
@@ -1104,10 +1168,34 @@ function applyFilter() {
     m.turns          += r.turns;
   }
 
-  // Filter sessions by model + date range
-  const filteredSessions = rawData.sessions_all.filter(s =>
-    selectedModels.has(s.model) && (!start || s.last_date >= start) && (!end || s.last_date <= end)
-  );
+  // Filter sessions by model + date range (minute-precision when startMs set)
+  const filteredSessions = rawData.sessions_all.filter(s => {
+    if (!selectedModels.has(s.model)) return false;
+    if (startMs != null) {
+      const ts = s.last_iso ? Date.parse(s.last_iso) : NaN;
+      if (!Number.isFinite(ts)) return false;
+      if (ts < startMs) return false;
+      if (endMs != null && ts > endMs) return false;
+      return true;
+    }
+    if (start && s.last_date < start) return false;
+    if (end && s.last_date > end) return false;
+    return true;
+  });
+
+  if (subDay) {
+    // Rebuild byModel from session totals (daily-bucketed rows are too coarse).
+    for (const k of Object.keys(modelMap)) delete modelMap[k];
+    for (const s of filteredSessions) {
+      if (!modelMap[s.model]) modelMap[s.model] = { model: s.model, input: 0, output: 0, cache_read: 0, cache_creation: 0, turns: 0, sessions: 0 };
+      const m = modelMap[s.model];
+      m.input          += s.input;
+      m.output         += s.output;
+      m.cache_read     += s.cache_read;
+      m.cache_creation += s.cache_creation;
+      m.turns          += s.turns;
+    }
+  }
 
   // Add session counts into modelMap
   for (const s of filteredSessions) {
@@ -1166,8 +1254,8 @@ function applyFilter() {
   const hourlyAgg = aggregateHourly(hourlySrc, hourlyTZ, rangeDayCount);
 
   // Update daily chart title
-  document.getElementById('daily-chart-title').textContent = 'Daily Token Usage \u2014 ' + RANGE_LABELS[selectedRange];
-  document.getElementById('hourly-chart-title').textContent = 'Average Hourly Distribution \u2014 ' + RANGE_LABELS[selectedRange];
+  document.getElementById('daily-chart-title').textContent = 'Daily Token Usage \u2014 ' + rangeLabel(selectedRange);
+  document.getElementById('hourly-chart-title').textContent = 'Average Hourly Distribution \u2014 ' + rangeLabel(selectedRange);
 
   renderStats(totals);
   renderDailyChart(daily);
@@ -1189,12 +1277,12 @@ function projectLabel(proj) {
 
 // ── Renderers ──────────────────────────────────────────────────────────────
 function renderStats(t) {
-  const rangeLabel = RANGE_LABELS[selectedRange].toLowerCase();
+  const subLabel = rangeLabel(selectedRange).toLowerCase();
   const stats = [
-    { label: 'Sessions',       value: t.sessions.toLocaleString(), sub: rangeLabel },
-    { label: 'Turns',          value: fmt(t.turns),                sub: rangeLabel },
-    { label: 'Input Tokens',   value: fmt(t.input),                sub: rangeLabel },
-    { label: 'Output Tokens',  value: fmt(t.output),               sub: rangeLabel },
+    { label: 'Sessions',       value: t.sessions.toLocaleString(), sub: subLabel },
+    { label: 'Turns',          value: fmt(t.turns),                sub: subLabel },
+    { label: 'Input Tokens',   value: fmt(t.input),                sub: subLabel },
+    { label: 'Output Tokens',  value: fmt(t.output),               sub: subLabel },
     { label: 'Cache Read',     value: fmt(t.cache_read),           sub: 'from prompt cache' },
     { label: 'Cache Creation', value: fmt(t.cache_creation),       sub: 'writes to prompt cache' },
     { label: 'Est. Cost',      value: fmtCostBig(t.cost),          sub: 'API pricing, Apr 2026', color: '#4ade80' },
@@ -1832,9 +1920,22 @@ async function loadData() {
     if (isFirstLoad) {
       // Restore range from URL, mark active button
       selectedRange = readURLRange();
+      const activeKey = isCustomRange(selectedRange) ? 'custom' : selectedRange;
       document.querySelectorAll('.range-btn').forEach(btn =>
-        btn.classList.toggle('active', btn.dataset.range === selectedRange)
+        btn.classList.toggle('active', btn.dataset.range === activeKey)
       );
+      if (isCustomRange(selectedRange)) {
+        const panel = document.getElementById('custom-range-panel');
+        if (panel) panel.style.display = '';
+        const amtEl = document.getElementById('custom-range-amount');
+        const unitEl = document.getElementById('custom-range-unit');
+        const m = customRangeMinutes;
+        if (amtEl && unitEl) {
+          if (m % 1440 === 0)      { amtEl.value = m / 1440; unitEl.value = 'd'; }
+          else if (m % 60 === 0)   { amtEl.value = m / 60;   unitEl.value = 'h'; }
+          else                     { amtEl.value = m;        unitEl.value = 'm'; }
+        }
+      }
       // Mark default TZ button active
       document.querySelectorAll('.tz-btn').forEach(btn =>
         btn.classList.toggle('active', btn.dataset.tz === hourlyTZ)
@@ -1930,14 +2031,11 @@ function renderWeeklyBar(wk) {
   bar.innerHTML = segs.join('') || '<div class="lc-fill" style="width:0%"></div>';
   const resetEl = document.getElementById('lc-weekly-reset');
   if (resetEl) resetEl.textContent = wk.reset_at ? fmtCountdown(wk.reset_at) : '—';
-  const titleEl = document.getElementById('lc-weekly-title');
-  if (titleEl) titleEl.textContent = 'Usage · ' + fmtWindow(wk.window_seconds || 604800) + ' window';
   const srcEl = document.getElementById('lc-weekly-anchor-src');
   if (srcEl) {
     const src = wk.anchor_source || 'auto';
     const anchorTxt = wk.anchor_at ? new Date(wk.anchor_at).toLocaleString() : '—';
-    const ws = wk.window_seconds || 604800;
-    srcEl.textContent = `anchor: ${anchorTxt} (${src}) · window: ${fmtWindow(ws)}`;
+    srcEl.textContent = `anchor: ${anchorTxt} (${src})`;
   }
 }
 async function postWeekly(body) {
@@ -1953,77 +2051,41 @@ function toIsoUtc(localStr) {
   if (!localStr) return new Date().toISOString();
   return new Date(localStr).toISOString();
 }
-const WINDOW_PRESETS = [1800, 3600, 10800, 21600, 43200, 86400, 259200, 604800];
-function fmtWindow(seconds) {
-  if (!seconds) return '7 d';
-  if (seconds < 3600) return Math.round(seconds / 60) + ' min';
-  if (seconds < 86400) return (seconds / 3600).toFixed(seconds % 3600 ? 1 : 0) + ' h';
-  return (seconds / 86400).toFixed(seconds % 86400 ? 1 : 0) + ' d';
-}
 function wireWeeklyCard() {
-  const sync       = document.getElementById('lc-weekly-sync');
-  const edit       = document.getElementById('lc-weekly-edit');
-  const save       = document.getElementById('lc-weekly-save');
-  const cancel     = document.getElementById('lc-weekly-cancel');
-  const clear      = document.getElementById('lc-weekly-clear');
-  const form       = document.getElementById('lc-weekly-edit-form');
-  const anchorIn   = document.getElementById('lc-weekly-anchor-input');
-  const percentIn  = document.getElementById('lc-weekly-percent-input');
-  const presetSel  = document.getElementById('lc-weekly-window-preset');
-  const customIn   = document.getElementById('lc-weekly-window-custom');
+  const sync      = document.getElementById('lc-weekly-sync');
+  const edit      = document.getElementById('lc-weekly-edit');
+  const save      = document.getElementById('lc-weekly-save');
+  const cancel    = document.getElementById('lc-weekly-cancel');
+  const clear     = document.getElementById('lc-weekly-clear');
+  const form      = document.getElementById('lc-weekly-edit-form');
+  const anchorIn  = document.getElementById('lc-weekly-anchor-input');
+  const percentIn = document.getElementById('lc-weekly-percent-input');
 
   const closeForm = () => { if (form) form.style.display = 'none'; };
   const fillNow = () => {
-    if (anchorIn) {
-      const d = new Date();
-      const pad = n => String(n).padStart(2, '0');
-      anchorIn.value = `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
-    }
+    if (!anchorIn) return;
+    const d = new Date();
+    const pad = n => String(n).padStart(2, '0');
+    anchorIn.value = `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
   };
-  const onPresetChange = () => {
-    if (!presetSel || !customIn) return;
-    customIn.style.display = presetSel.value === 'custom' ? '' : 'none';
-    if (presetSel.value === 'custom') customIn.focus();
-  };
-  if (presetSel) presetSel.addEventListener('change', onPresetChange);
-
-  const getWindowSeconds = () => {
-    if (!presetSel) return 604800;
-    if (presetSel.value === 'custom') {
-      const mins = parseInt(customIn.value, 10);
-      if (isNaN(mins) || mins < 30 || mins > 10080) return null;
-      return mins * 60;
-    }
-    return parseInt(presetSel.value, 10);
-  };
-
   if (sync) sync.addEventListener('click', async () => {
-    if (!confirm('Set the usage-window anchor to NOW with 0% used?\\n\\nOnly click after Claude shows a fresh 0%.')) return;
+    if (!confirm('Set the weekly reset anchor to NOW?\\n\\nOnly click after Claude shows a fresh 0%.')) return;
     sync.disabled = true; sync.textContent = 'Syncing…';
     try { await postWeekly({}); }
     catch (e) { alert('Failed: ' + e.message); }
     finally { sync.disabled = false; sync.textContent = 'Sync reset to now'; }
   });
-
   if (edit) edit.addEventListener('click', () => {
     if (!form) return;
     const opening = form.style.display === 'none';
     form.style.display = opening ? 'block' : 'none';
-    if (opening) {
-      fillNow();
-      if (percentIn) { percentIn.value = ''; percentIn.focus(); }
-      onPresetChange();
-    }
+    if (opening) { fillNow(); if (percentIn) { percentIn.value = ''; percentIn.focus(); } }
   });
   if (cancel) cancel.addEventListener('click', closeForm);
-
   const doSave = async () => {
-    const ws = getWindowSeconds();
-    if (ws === null) { alert('Custom window must be 30–10080 minutes.'); return; }
     const payload = {
       anchor_at: anchorIn && anchorIn.value ? toIsoUtc(anchorIn.value) : new Date().toISOString(),
       percent: percentIn && percentIn.value !== '' ? parseFloat(percentIn.value) : 0,
-      window_seconds: ws,
     };
     if (!save) return;
     save.disabled = true; save.textContent = 'Saving…';
@@ -2032,7 +2094,7 @@ function wireWeeklyCard() {
     finally { save.disabled = false; save.textContent = 'Save'; }
   };
   if (save) save.addEventListener('click', doSave);
-  [anchorIn, percentIn, customIn].forEach(inp => {
+  [anchorIn, percentIn].forEach(inp => {
     if (!inp) return;
     inp.addEventListener('keydown', ev => {
       if (ev.key === 'Enter') { ev.preventDefault(); doSave(); }
@@ -2040,7 +2102,7 @@ function wireWeeklyCard() {
     });
   });
   if (clear) clear.addEventListener('click', async () => {
-    if (!confirm('Clear manual override and return to auto-detection (7d window)?')) return;
+    if (!confirm('Clear manual override and return to auto-detection?')) return;
     try { await postWeekly({clear: true}); }
     catch (e) { alert('Failed: ' + e.message); }
   });
@@ -2198,7 +2260,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if self.path == "/api/weekly/sync-reset":
             from limits import (
                 set_weekly_anchor, clear_weekly_anchor, detect_plan,
-                WEEKLY_WINDOW_SECONDS, MIN_WINDOW_SECONDS, MAX_WINDOW_SECONDS,
             )
             length = int(self.headers.get("Content-Length", "0") or 0)
             payload = {}
@@ -2232,23 +2293,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 except (ValueError, AttributeError):
                     anchor_at = None
 
-            window_seconds = None
-            if payload.get("window_seconds") is not None:
-                try:
-                    ws = int(payload["window_seconds"])
-                    window_seconds = max(MIN_WINDOW_SECONDS,
-                                         min(MAX_WINDOW_SECONDS, ws))
-                except (TypeError, ValueError):
-                    window_seconds = None
-
             budgets = detect_plan()["budgets"]
-            full_cap = budgets["weekly_all_tokens"]
-            effective_cap = full_cap
-            if window_seconds is not None:
-                effective_cap = max(
-                    1,
-                    int(round(full_cap * window_seconds / WEEKLY_WINDOW_SECONDS))
-                )
+            cap = budgets["weekly_all_tokens"]
             baseline = 0
             if payload.get("baseline_used") is not None:
                 try:
@@ -2259,20 +2305,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 try:
                     baseline = max(
                         0,
-                        int(round(float(payload["percent"]) / 100.0 * effective_cap))
+                        int(round(float(payload["percent"]) / 100.0 * cap))
                     )
                 except (TypeError, ValueError):
                     baseline = 0
 
-            anchor = set_weekly_anchor(
-                anchor_at, baseline_used=baseline,
-                window_seconds=window_seconds,
-            )
+            anchor = set_weekly_anchor(anchor_at, baseline_used=baseline)
 
             body = json.dumps({
                 "anchor_at": anchor.isoformat(),
                 "baseline_used": baseline,
-                "window_seconds": window_seconds,
             }).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")

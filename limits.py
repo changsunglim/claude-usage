@@ -32,10 +32,6 @@ PLAN_CACHE_PATH = Path.home() / ".claude" / "usage-plan-cache.json"
 PLAN_CACHE_TTL_SECONDS = 24 * 3600
 WEEKLY_ANCHOR_PATH = Path.home() / ".claude" / "usage-weekly-anchor.json"
 WEEKLY_WINDOW = timedelta(days=7)
-WEEKLY_WINDOW_SECONDS = int(WEEKLY_WINDOW.total_seconds())
-# Window length bounds for the user-configurable usage window.
-MIN_WINDOW_SECONDS = 30 * 60          # 30 minutes
-MAX_WINDOW_SECONDS = 7 * 24 * 3600    # 7 days
 
 PLAN_BUDGETS = {
     "pro":    {"label": "Pro",     "weekly_all_tokens": 23_000_000},
@@ -236,29 +232,17 @@ def _load_weekly_anchor():
     return None
 
 
-def _clamp_window_seconds(value):
-    try:
-        v = int(value)
-    except (TypeError, ValueError):
-        return WEEKLY_WINDOW_SECONDS
-    return max(MIN_WINDOW_SECONDS, min(MAX_WINDOW_SECONDS, v))
-
-
-def _save_weekly_anchor(anchor_at, source, baseline_used=0, save_at=None,
-                        window_seconds=None):
+def _save_weekly_anchor(anchor_at, source, baseline_used=0, save_at=None):
     """Persist weekly anchor to disk. `save_at` is the moment the baseline
     was captured; tokens at-or-after save_at accumulate ON TOP of baseline.
-    `window_seconds` is the rolling-window length (default 7d)."""
+    Without save_at, baseline_used double-counts turns between anchor_at
+    and the save moment."""
     try:
         WEEKLY_ANCHOR_PATH.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "anchor_at": anchor_at.isoformat(),
             "source": source,
             "baseline_used": int(baseline_used or 0),
-            "window_seconds": _clamp_window_seconds(
-                window_seconds if window_seconds is not None
-                else WEEKLY_WINDOW_SECONDS
-            ),
         }
         if save_at is not None:
             payload["save_at"] = save_at.isoformat()
@@ -269,23 +253,15 @@ def _save_weekly_anchor(anchor_at, source, baseline_used=0, save_at=None,
 
 
 def set_weekly_anchor(anchor_at=None, baseline_used=0, source="manual",
-                      save_at=None, window_seconds=None):
+                      save_at=None):
     """Manually set weekly anchor. `baseline_used` is the token count
     already consumed at the moment of `save_at` (or `anchor_at` if save_at
     is None). Delta accumulates from save_at forward to avoid double-counting
-    turns between anchor_at and save_at. `window_seconds` overrides the
-    default 7-day window; if None, the existing persisted window length is
-    preserved (or defaults to 7d when no anchor exists)."""
+    turns between anchor_at and save_at."""
     anchor_at = anchor_at or datetime.now(timezone.utc)
     if save_at is None and baseline_used:
         save_at = datetime.now(timezone.utc)
-    if window_seconds is None:
-        existing = _load_weekly_anchor()
-        window_seconds = (existing or {}).get(
-            "window_seconds", WEEKLY_WINDOW_SECONDS
-        )
-    _save_weekly_anchor(anchor_at, source, baseline_used, save_at,
-                        window_seconds)
+    _save_weekly_anchor(anchor_at, source, baseline_used, save_at)
     return anchor_at
 
 
@@ -312,21 +288,20 @@ def _earliest_turn_ts(conn, since):
 
 
 def _resolve_weekly_anchor(conn, now):
-    """Return (anchor_at, source, baseline_used, save_at, window_seconds).
+    """Return (anchor_at, source, baseline_used, save_at).
 
     Strategy:
-      1. Load persisted anchor. If still within window (anchor + W > now),
+      1. Load persisted anchor. If still within window (anchor + 7d > now),
          use it as-is including baseline_used.
-      2. If expired, auto-advance: find first turn at-or-after anchor + W
+      2. If expired, auto-advance: find first turn at-or-after anchor + 7d
          and treat as new anchor; baseline_used resets to 0.
-      3. If no persisted anchor, fall back to earliest turn in last W.
+      3. If no persisted anchor, fall back to earliest turn in last 7d.
     """
     persisted = _load_weekly_anchor()
     anchor = None
     source = "auto"
     baseline = 0
     save_at = None
-    window_seconds = WEEKLY_WINDOW_SECONDS
 
     if persisted:
         try:
@@ -337,9 +312,6 @@ def _resolve_weekly_anchor(conn, now):
             baseline = int(persisted.get("baseline_used", 0) or 0)
         except (ValueError, AttributeError, KeyError):
             anchor = None
-        window_seconds = _clamp_window_seconds(
-            persisted.get("window_seconds", WEEKLY_WINDOW_SECONDS)
-        )
         sa_raw = persisted.get("save_at") if persisted else None
         if sa_raw:
             try:
@@ -349,18 +321,15 @@ def _resolve_weekly_anchor(conn, now):
             except (ValueError, AttributeError):
                 save_at = None
 
-    window = timedelta(seconds=window_seconds)
-
     if anchor is None:
-        fallback = _earliest_turn_ts(conn, now - window)
+        fallback = _earliest_turn_ts(conn, now - WEEKLY_WINDOW)
         anchor = fallback or now
-        _save_weekly_anchor(anchor, "auto", 0,
-                            window_seconds=window_seconds)
-        return anchor, "auto", 0, None, window_seconds
+        _save_weekly_anchor(anchor, "auto", 0)
+        return anchor, "auto", 0, None
 
     advanced = False
-    while anchor + window <= now:
-        next_window_start = anchor + window
+    while anchor + WEEKLY_WINDOW <= now:
+        next_window_start = anchor + WEEKLY_WINDOW
         next_anchor = _earliest_turn_ts(conn, next_window_start)
         anchor = next_anchor if next_anchor else next_window_start
         source = "auto"
@@ -369,23 +338,21 @@ def _resolve_weekly_anchor(conn, now):
         advanced = True
 
     if advanced:
-        _save_weekly_anchor(anchor, source, baseline,
-                            window_seconds=window_seconds)
-    return anchor, source, baseline, save_at, window_seconds
+        _save_weekly_anchor(anchor, source, baseline)
+    return anchor, source, baseline, save_at
 
 
 def compute_weekly(conn, now=None):
-    """Compute usage in the rolling window (default 7d, user-configurable
-    down to 30 minutes). Anchored to the user's first turn of the cycle and
-    auto-advances when the window expires. Manual overrides via
-    set_weekly_anchor() let users align with `claude /usage`.
+    """Compute weekly usage anchored to Anthropic's per-user reset.
+
+    Anthropic's weekly window opens with the user's first message of
+    the cycle and closes 7 days later. The anchor is per-account, so we
+    can't hardcode it — we persist it locally and auto-advance when it
+    expires.
     """
     now = now or datetime.now(timezone.utc)
-    (
-        anchor_at, anchor_source, baseline, save_at, window_seconds
-    ) = _resolve_weekly_anchor(conn, now)
-    window = timedelta(seconds=window_seconds)
-    reset_at = anchor_at + window
+    anchor_at, anchor_source, baseline, save_at = _resolve_weekly_anchor(conn, now)
+    reset_at = anchor_at + WEEKLY_WINDOW
     delta_since = save_at or anchor_at
 
     rows = conn.execute(
@@ -407,7 +374,6 @@ def compute_weekly(conn, now=None):
     return {
         "window_start": anchor_at.isoformat(),
         "window_end": now.isoformat(),
-        "window_seconds": window_seconds,
         "anchor_at": anchor_at.isoformat(),
         "anchor_source": anchor_source,
         "baseline_used": baseline,
@@ -544,13 +510,7 @@ def get_limits(db_path=DB_PATH):
             return None
         return min(100.0, round(100.0 * used / cap, 1))
 
-    full_weekly_cap = budgets["weekly_all_tokens"]
-    window_seconds = weekly.get("window_seconds", WEEKLY_WINDOW_SECONDS)
-    # Scale cap proportional to chosen window length. The plan budget is
-    # a 7d figure; a shorter window gets a proportionally smaller cap.
-    weekly_cap = max(
-        1, int(round(full_weekly_cap * window_seconds / WEEKLY_WINDOW_SECONDS))
-    )
+    weekly_cap = budgets["weekly_all_tokens"]
     weekly_used = weekly["total"]
 
     return {
@@ -558,7 +518,6 @@ def get_limits(db_path=DB_PATH):
         "weekly_all": {
             "used": weekly_used,
             "cap": weekly_cap,
-            "full_cap": full_weekly_cap,
             "remaining": max(0, weekly_cap - weekly_used),
             "percent": pct(weekly_used, weekly_cap),
             "by_model": weekly["by_model"],
@@ -569,7 +528,6 @@ def get_limits(db_path=DB_PATH):
             "anchor_source": weekly["anchor_source"],
             "baseline_used": weekly.get("baseline_used", 0),
             "reset_at": weekly["reset_at"],
-            "window_seconds": window_seconds,
         },
         "session_health": warning,
         "weekly_claude_design": {
