@@ -576,16 +576,17 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     </div>
   </div>
   <div class="limit-card" id="lc-session">
-    <div class="lc-head"><span>Session · 5h</span><span class="lc-pct">—</span></div>
+    <div class="lc-head"><span>Current Session · 5h</span><span class="lc-pct">—</span></div>
     <div class="lc-bar"><div class="lc-fill"></div></div>
     <div class="lc-foot"><span class="lc-used">— / —</span><span class="lc-reset" id="lc-session-reset">—</span></div>
+    <div style="font-size:10px;opacity:0.5;margin-top:3px">Auto-count may be inaccurate (cap estimate). Use Edit to sync with claude /usage.</div>
     <div class="lc-sync" style="margin-top:6px;font-size:11px;opacity:0.85">
       <button id="lc-session-sync" class="filter-btn" style="padding:2px 8px;font-size:11px"
         title="Click right after you see a fresh 0% session window in claude /usage.">
         Sync reset to now
       </button>
       <button id="lc-session-edit" class="filter-btn" style="padding:2px 8px;font-size:11px;margin-left:4px"
-        title="Manually edit session anchor and current percent.">
+        title="Manually edit session percent and time remaining.">
         Edit…
       </button>
       <button id="lc-session-clear" class="filter-btn" style="padding:2px 8px;font-size:11px;margin-left:4px"
@@ -593,12 +594,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         Clear
       </button>
       <div id="lc-session-edit-form" style="display:none;margin-top:6px;padding:6px;border:1px solid #2a3142;border-radius:4px">
-        <label style="display:block;margin-bottom:4px">Anchor (session start):
-          <input id="lc-session-anchor-input" type="datetime-local" style="background:#1a1f2c;color:#e8ecf3;border:1px solid #2a3142;padding:2px 4px;font-size:11px">
+        <label style="display:block;margin-bottom:4px">% shown in claude /usage right NOW: <span style="opacity:0.6">(Enter=save, Esc=cancel)</span>
+          <input id="lc-session-percent-input" type="number" min="0" max="100" step="0.1" placeholder="e.g. 73" style="width:70px;background:#1a1f2c;color:#e8ecf3;border:1px solid #2a3142;padding:2px 4px;font-size:11px">
         </label>
-        <label style="display:block;margin-bottom:4px">% shown in Claude Settings right NOW (Enter=save, Esc=cancel):
-          <input id="lc-session-percent-input" type="number" min="0" max="100" step="0.1" placeholder="0" style="width:60px;background:#1a1f2c;color:#e8ecf3;border:1px solid #2a3142;padding:2px 4px;font-size:11px">
+        <label style="display:block;margin-bottom:4px">Time remaining to reset (hh:mm): <span style="opacity:0.6">auto-calculates anchor</span>
+          <input id="lc-session-remaining-input" type="text" placeholder="e.g. 4:20" maxlength="5" style="width:60px;background:#1a1f2c;color:#e8ecf3;border:1px solid #2a3142;padding:2px 4px;font-size:11px">
         </label>
+        <label style="display:block;margin-bottom:6px;opacity:0.65">Anchor auto-calculated: <span id="lc-session-anchor-calc">—</span></label>
         <button id="lc-session-save" class="filter-btn" style="padding:2px 8px;font-size:11px">Save</button>
         <button id="lc-session-cancel" class="filter-btn" style="padding:2px 8px;font-size:11px;margin-left:4px">Cancel</button>
       </div>
@@ -1962,34 +1964,93 @@ function toIsoUtc(localStr) {
   // datetime-local gives "YYYY-MM-DDTHH:MM" in local time
   return new Date(localStr).toISOString();
 }
+// Parse "h:mm" or "hh:mm" → total minutes. Returns NaN if invalid.
+function parseHHMM(str) {
+  if (!str) return NaN;
+  const m = str.trim().match(/^(\d{1,2}):(\d{2})$/);
+  if (!m) return NaN;
+  const h = parseInt(m[1], 10), mn = parseInt(m[2], 10);
+  if (mn >= 60) return NaN;
+  return h * 60 + mn;
+}
+function minsToHHMM(totalMins) {
+  const h = Math.floor(totalMins / 60), m = totalMins % 60;
+  return `${h}:${String(m).padStart(2, '0')}`;
+}
 function wireAnchorCard(kind) {
-  const sync = document.getElementById('lc-' + kind + '-sync');
-  const edit = document.getElementById('lc-' + kind + '-edit');
-  const save = document.getElementById('lc-' + kind + '-save');
-  const cancel = document.getElementById('lc-' + kind + '-cancel');
-  const clear = document.getElementById('lc-' + kind + '-clear');
-  const form = document.getElementById('lc-' + kind + '-edit-form');
-  const anchorInput = document.getElementById('lc-' + kind + '-anchor-input');
-  const percentInput = document.getElementById('lc-' + kind + '-percent-input');
+  const isSession = kind === 'session';
+  const sync    = document.getElementById('lc-' + kind + '-sync');
+  const edit    = document.getElementById('lc-' + kind + '-edit');
+  const save    = document.getElementById('lc-' + kind + '-save');
+  const cancel  = document.getElementById('lc-' + kind + '-cancel');
+  const clear   = document.getElementById('lc-' + kind + '-clear');
+  const form    = document.getElementById('lc-' + kind + '-edit-form');
+  // weekly has anchor-input; session has remaining-input + anchor-calc display
+  const anchorInput    = document.getElementById('lc-' + kind + '-anchor-input');
+  const percentInput   = document.getElementById('lc-' + kind + '-percent-input');
+  const remainingInput = document.getElementById('lc-' + kind + '-remaining-input');
+  const anchorCalc     = document.getElementById('lc-' + kind + '-anchor-calc');
+
+  // Session: when user types time-remaining, update anchor-calc display
+  if (remainingInput && anchorCalc) {
+    const updateCalc = () => {
+      const mins = parseHHMM(remainingInput.value);
+      if (isNaN(mins) || mins < 0 || mins > 300) {
+        anchorCalc.textContent = '—';
+        return;
+      }
+      // anchor = now - (5h - remaining)
+      const anchorMs = Date.now() - (5 * 60 - mins) * 60 * 1000;
+      anchorCalc.textContent = new Date(anchorMs).toLocaleString();
+    };
+    remainingInput.addEventListener('input', updateCalc);
+  }
+
+  // Build anchor ISO from remaining input (session) or datetime-local input (weekly)
+  const getAnchorIso = () => {
+    if (isSession && remainingInput && remainingInput.value.trim()) {
+      const mins = parseHHMM(remainingInput.value);
+      if (!isNaN(mins) && mins >= 0 && mins <= 300) {
+        // anchor = now - (5h - remaining); clamp to <= now
+        const ms = Date.now() - (5 * 60 - mins) * 60 * 1000;
+        return new Date(Math.min(ms, Date.now())).toISOString();
+      }
+    }
+    // weekly: use anchor datetime input, or fallback to now
+    if (anchorInput && anchorInput.value) return toIsoUtc(anchorInput.value);
+    return new Date().toISOString();
+  };
+
   if (sync) sync.addEventListener('click', async () => {
-    const label = kind === 'weekly' ? 'weekly' : '5h session';
+    const label = isSession ? '5h session' : 'weekly';
     if (!confirm(`Set the ${label} reset anchor to NOW?\\n\\nOnly click after Claude shows a fresh 0%.`)) return;
     sync.disabled = true; sync.textContent = 'Syncing…';
     try { await postAnchor(kind, {}); }
     catch (e) { alert('Failed: ' + e.message); }
     finally { sync.disabled = false; sync.textContent = 'Sync reset to now'; }
   });
+
   const fillNow = () => {
-    if (!anchorInput) return;
-    const d = new Date();
-    const pad = n => String(n).padStart(2, '0');
-    anchorInput.value = `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    if (anchorInput) {
+      const d = new Date();
+      const pad = n => String(n).padStart(2, '0');
+      anchorInput.value = `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    }
+    if (remainingInput) remainingInput.value = '';
+    if (anchorCalc) anchorCalc.textContent = '—';
   };
   const closeForm = () => { if (form) form.style.display = 'none'; };
   const doSave = async () => {
+    if (isSession && remainingInput) {
+      const mins = parseHHMM(remainingInput.value);
+      if (remainingInput.value.trim() && (isNaN(mins) || mins < 0 || mins > 300)) {
+        alert('Time remaining format: h:mm (e.g. 4:20). Max 5:00.');
+        return;
+      }
+    }
     const payload = {
-      anchor_at: toIsoUtc(anchorInput && anchorInput.value),
-      percent: percentInput && percentInput.value ? parseFloat(percentInput.value) : 0,
+      anchor_at: getAnchorIso(),
+      percent: percentInput && percentInput.value !== '' ? parseFloat(percentInput.value) : 0,
     };
     if (!save) return;
     save.disabled = true; save.textContent = 'Saving…';
@@ -1999,21 +2060,23 @@ function wireAnchorCard(kind) {
     } catch (e) { alert('Failed: ' + e.message); }
     finally { save.disabled = false; save.textContent = 'Save'; }
   };
+
   if (edit) edit.addEventListener('click', () => {
     if (form) {
       const opening = form.style.display === 'none';
       form.style.display = opening ? 'block' : 'none';
       if (opening) {
         fillNow();
+        // focus percent first so user types % then remaining
         if (percentInput) { percentInput.value = ''; percentInput.focus(); }
       }
     }
   });
   if (cancel) cancel.addEventListener('click', closeForm);
   if (save) save.addEventListener('click', doSave);
-  [anchorInput, percentInput].forEach(inp => {
+  [anchorInput, percentInput, remainingInput].forEach(inp => {
     if (!inp) return;
-    inp.addEventListener('keydown', (ev) => {
+    inp.addEventListener('keydown', ev => {
       if (ev.key === 'Enter') { ev.preventDefault(); doSave(); }
       else if (ev.key === 'Escape') { ev.preventDefault(); closeForm(); }
     });
@@ -2213,6 +2276,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 except (json.JSONDecodeError, UnicodeDecodeError):
                     payload = {}
 
+            now = datetime.now(timezone.utc)
             anchor_at = None
             if payload.get("anchor_at"):
                 try:
@@ -2221,6 +2285,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     )
                     if anchor_at.tzinfo is None:
                         anchor_at = anchor_at.replace(tzinfo=timezone.utc)
+                    # Clamp: anchor must be <= now. A future anchor (clock
+                    # skew, sub-second delay) causes delta=0 indefinitely.
+                    if anchor_at > now:
+                        anchor_at = now
                 except (ValueError, AttributeError):
                     anchor_at = None
 
