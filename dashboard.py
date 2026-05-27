@@ -566,7 +566,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <label style="display:block;margin-bottom:4px">Anchor (last reset time):
           <input id="lc-weekly-anchor-input" type="datetime-local" style="background:#1a1f2c;color:#e8ecf3;border:1px solid #2a3142;padding:2px 4px;font-size:11px">
         </label>
-        <label style="display:block;margin-bottom:4px">Used % at that moment (from Claude Settings → Usage):
+        <label style="display:block;margin-bottom:4px">% shown in Claude Settings right NOW (Enter=save, Esc=cancel):
           <input id="lc-weekly-percent-input" type="number" min="0" max="100" step="0.1" placeholder="0" style="width:60px;background:#1a1f2c;color:#e8ecf3;border:1px solid #2a3142;padding:2px 4px;font-size:11px">
         </label>
         <button id="lc-weekly-save" class="filter-btn" style="padding:2px 8px;font-size:11px">Save</button>
@@ -596,7 +596,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <label style="display:block;margin-bottom:4px">Anchor (session start):
           <input id="lc-session-anchor-input" type="datetime-local" style="background:#1a1f2c;color:#e8ecf3;border:1px solid #2a3142;padding:2px 4px;font-size:11px">
         </label>
-        <label style="display:block;margin-bottom:4px">Used % at that moment:
+        <label style="display:block;margin-bottom:4px">% shown in Claude Settings right NOW (Enter=save, Esc=cancel):
           <input id="lc-session-percent-input" type="number" min="0" max="100" step="0.1" placeholder="0" style="width:60px;background:#1a1f2c;color:#e8ecf3;border:1px solid #2a3142;padding:2px 4px;font-size:11px">
         </label>
         <button id="lc-session-save" class="filter-btn" style="padding:2px 8px;font-size:11px">Save</button>
@@ -1979,26 +1979,44 @@ function wireAnchorCard(kind) {
     catch (e) { alert('Failed: ' + e.message); }
     finally { sync.disabled = false; sync.textContent = 'Sync reset to now'; }
   });
-  if (edit) edit.addEventListener('click', () => {
-    if (form) form.style.display = form.style.display === 'none' ? 'block' : 'none';
-    if (anchorInput && !anchorInput.value) {
-      const d = new Date();
-      const pad = n => String(n).padStart(2, '0');
-      anchorInput.value = `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
-    }
-  });
-  if (cancel) cancel.addEventListener('click', () => { if (form) form.style.display = 'none'; });
-  if (save) save.addEventListener('click', async () => {
+  const fillNow = () => {
+    if (!anchorInput) return;
+    const d = new Date();
+    const pad = n => String(n).padStart(2, '0');
+    anchorInput.value = `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  };
+  const closeForm = () => { if (form) form.style.display = 'none'; };
+  const doSave = async () => {
     const payload = {
       anchor_at: toIsoUtc(anchorInput && anchorInput.value),
       percent: percentInput && percentInput.value ? parseFloat(percentInput.value) : 0,
     };
+    if (!save) return;
     save.disabled = true; save.textContent = 'Saving…';
     try {
       await postAnchor(kind, payload);
-      if (form) form.style.display = 'none';
+      closeForm();
     } catch (e) { alert('Failed: ' + e.message); }
     finally { save.disabled = false; save.textContent = 'Save'; }
+  };
+  if (edit) edit.addEventListener('click', () => {
+    if (form) {
+      const opening = form.style.display === 'none';
+      form.style.display = opening ? 'block' : 'none';
+      if (opening) {
+        fillNow();
+        if (percentInput) { percentInput.value = ''; percentInput.focus(); }
+      }
+    }
+  });
+  if (cancel) cancel.addEventListener('click', closeForm);
+  if (save) save.addEventListener('click', doSave);
+  [anchorInput, percentInput].forEach(inp => {
+    if (!inp) return;
+    inp.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') { ev.preventDefault(); doSave(); }
+      else if (ev.key === 'Escape') { ev.preventDefault(); closeForm(); }
+    });
   });
   if (clear) clear.addEventListener('click', async () => {
     if (!confirm('Clear manual override and return to auto-detection?')) return;
