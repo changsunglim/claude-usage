@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-05-27
+
+- Fix weekly all-models bar not reflecting Anthropic's per-user reset: the previous rolling 7d sum drifted after Anthropic's actual reset fired
+- Anchor weekly window per install (persisted at `~/.claude/usage-weekly-anchor.json`), auto-advance after expiry by the first turn observed in the new window
+- Add `Sync reset to now` button on the weekly card for manual override (use when Claude Settings → Usage shows a fresh 0%)
+- Replace "7d rolling" footer text with a live countdown to the next reset, plus anchor source ("manual" / "auto")
+- New POST `/api/weekly/sync-reset` endpoint
+
 ## 2026-04-09
 
 - Fix token counts inflated ~2x by deduplicating streaming events that share the same message ID

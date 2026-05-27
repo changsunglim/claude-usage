@@ -551,8 +551,15 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <div class="limit-card" id="lc-weekly">
     <div class="lc-head"><span>Weekly · All Models</span><span class="lc-pct">—</span></div>
     <div class="lc-bar"><div class="lc-fill"></div></div>
-    <div class="lc-foot"><span class="lc-used">— / —</span><span class="lc-reset">7d rolling</span></div>
+    <div class="lc-foot"><span class="lc-used">— / —</span><span class="lc-reset" id="lc-weekly-reset">—</span></div>
     <div class="lc-models" id="lc-weekly-models"></div>
+    <div class="lc-sync" style="margin-top:6px;font-size:11px;opacity:0.75">
+      <button id="lc-weekly-sync" class="filter-btn" style="padding:2px 8px;font-size:11px"
+        title="Click after you see a fresh 0% in Claude Settings → Usage. Resets the local anchor to now so the bar tracks Anthropic's actual reset.">
+        Sync reset to now
+      </button>
+      <span id="lc-weekly-anchor-src" style="margin-left:8px"></span>
+    </div>
   </div>
   <div id="lc-health" class="health-ok">
     <div class="lc-head"><span>Session Health</span><span id="health-session-id" style="text-transform:none;letter-spacing:0">—</span></div>
@@ -1887,7 +1894,34 @@ function renderWeeklyBar(wk) {
       return `<div class="lc-seg" style="width:${pct}%;background:${LIMITS_MODEL_COLORS[k]}" title="${k}: ${fmtTokens(byTokens[k])} (${pct.toFixed(1)}%)"></div>`;
     });
   bar.innerHTML = segs.join('') || '<div class="lc-fill" style="width:0%"></div>';
+  const resetEl = document.getElementById('lc-weekly-reset');
+  if (resetEl) resetEl.textContent = wk.reset_at ? fmtCountdown(wk.reset_at) : '—';
+  const srcEl = document.getElementById('lc-weekly-anchor-src');
+  if (srcEl) {
+    const src = wk.anchor_source || 'auto';
+    const anchorTxt = wk.anchor_at ? new Date(wk.anchor_at).toLocaleString() : '—';
+    srcEl.textContent = `anchor: ${anchorTxt} (${src})`;
+  }
 }
+async function syncWeeklyReset() {
+  const btn = document.getElementById('lc-weekly-sync');
+  if (!btn) return;
+  if (!confirm('Set the weekly reset anchor to NOW?\\n\\nOnly click this right after you see a fresh 0% in Claude Settings → Usage. This tells the dashboard that Anthropic just reset your weekly limit.')) return;
+  btn.disabled = true; btn.textContent = 'Syncing…';
+  try {
+    const r = await fetch('/api/weekly/sync-reset', { method: 'POST' });
+    if (!r.ok) throw new Error('sync failed');
+    await loadLimits();
+  } catch (e) {
+    alert('Sync failed: ' + e.message);
+  } finally {
+    btn.disabled = false; btn.textContent = 'Sync reset to now';
+  }
+}
+document.addEventListener('DOMContentLoaded', () => {
+  const b = document.getElementById('lc-weekly-sync');
+  if (b) b.addEventListener('click', syncWeeklyReset);
+});
 function renderWeeklyModels(wk) {
   const host = document.getElementById('lc-weekly-models');
   if (!host) return;
@@ -2037,6 +2071,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def do_POST(self):
+        if self.path == "/api/weekly/sync-reset":
+            from limits import set_weekly_anchor
+            anchor = set_weekly_anchor()
+            body = json.dumps({"anchor_at": anchor.isoformat()}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if self.path == "/api/rescan":
             # Full rebuild: delete DB and rescan from scratch.
             # Pass DB_PATH / DEFAULT_PROJECTS_DIRS explicitly so tests that

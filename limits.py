@@ -30,6 +30,8 @@ from pathlib import Path
 DB_PATH = Path.home() / ".claude" / "usage.db"
 PLAN_CACHE_PATH = Path.home() / ".claude" / "usage-plan-cache.json"
 PLAN_CACHE_TTL_SECONDS = 24 * 3600
+WEEKLY_ANCHOR_PATH = Path.home() / ".claude" / "usage-weekly-anchor.json"
+WEEKLY_WINDOW = timedelta(days=7)
 
 # Approximate per-plan budgets. Source: Anthropic public docs + community
 # observation. Token figures are rough — used for progress bars only.
@@ -308,18 +310,116 @@ def compute_session_5h(conn, now=None):
     }
 
 
-def compute_weekly(conn, now=None):
-    """Compute rolling 7-day usage. Anthropic uses a single 'All models'
-    bucket for the weekly cap, plus a separate Claude Design bucket which
-    is not represented in local JSONL (web-only feature)."""
+def _load_weekly_anchor():
+    """Read persisted weekly anchor. Returns dict or None."""
+    try:
+        with open(WEEKLY_ANCHOR_PATH, "r") as f:
+            data = json.load(f)
+        if "anchor_at" in data:
+            return data
+    except (OSError, json.JSONDecodeError):
+        pass
+    return None
+
+
+def _save_weekly_anchor(anchor_at, source):
+    """Persist weekly anchor to disk."""
+    try:
+        WEEKLY_ANCHOR_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(WEEKLY_ANCHOR_PATH, "w") as f:
+            json.dump(
+                {"anchor_at": anchor_at.isoformat(), "source": source},
+                f,
+            )
+    except OSError:
+        pass
+
+
+def set_weekly_anchor(now=None):
+    """Manually set weekly anchor to `now`. Called when user confirms a
+    fresh reset in Claude Settings → Usage."""
     now = now or datetime.now(timezone.utc)
-    week_ago = now - timedelta(days=7)
+    _save_weekly_anchor(now, "manual")
+    return now
+
+
+def _earliest_turn_ts(conn, since):
+    """Earliest turn timestamp at or after `since`. None if no rows."""
+    row = conn.execute(
+        "SELECT MIN(timestamp) AS t FROM turns WHERE timestamp >= ?",
+        (since.isoformat(),),
+    ).fetchone()
+    if not row or not row["t"]:
+        return None
+    try:
+        return datetime.fromisoformat(row["t"].replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return None
+
+
+def _resolve_weekly_anchor(conn, now):
+    """Return (anchor_at: datetime, source: str).
+
+    Strategy:
+      1. Load persisted anchor. If it's still within its 7d window
+         (anchor + 7d > now), use it as-is.
+      2. If persisted anchor has expired, auto-advance: find the
+         first turn at-or-after anchor + 7d and treat that as the
+         new anchor (this is when the user reopened Claude after
+         Anthropic's reset). Persist as auto.
+      3. If no persisted anchor, fall back to the earliest turn in
+         the last 7 days (best-effort approximation). Persist as auto.
+    """
+    persisted = _load_weekly_anchor()
+    anchor = None
+    source = "auto"
+
+    if persisted:
+        try:
+            anchor = datetime.fromisoformat(
+                persisted["anchor_at"].replace("Z", "+00:00")
+            )
+            source = persisted.get("source", "auto")
+        except (ValueError, AttributeError, KeyError):
+            anchor = None
+
+    if anchor is None:
+        fallback = _earliest_turn_ts(conn, now - WEEKLY_WINDOW)
+        anchor = fallback or now
+        _save_weekly_anchor(anchor, "auto")
+        return anchor, "auto"
+
+    while anchor + WEEKLY_WINDOW <= now:
+        next_window_start = anchor + WEEKLY_WINDOW
+        next_anchor = _earliest_turn_ts(conn, next_window_start)
+        if next_anchor is None:
+            anchor = next_window_start
+        else:
+            anchor = next_anchor
+        source = "auto"
+
+    _save_weekly_anchor(anchor, source)
+    return anchor, source
+
+
+def compute_weekly(conn, now=None):
+    """Compute weekly usage anchored to Anthropic's per-user reset.
+
+    Anthropic's weekly window opens with the user's first message of
+    the cycle and closes 7 days later. The anchor is per-account, so we
+    can't hardcode it — we persist it locally and auto-advance when it
+    expires. Users can also force-sync via set_weekly_anchor() when they
+    see a fresh 0% in Claude Settings → Usage.
+    """
+    now = now or datetime.now(timezone.utc)
+    anchor_at, anchor_source = _resolve_weekly_anchor(conn, now)
+    reset_at = anchor_at + WEEKLY_WINDOW
 
     rows = conn.execute(
         "SELECT model, input_tokens, output_tokens, cache_creation_tokens, "
         "       cache_read_tokens "
         "FROM turns WHERE timestamp >= ?",
-        (week_ago.isoformat(),),
+        (anchor_at.isoformat(),),
     ).fetchall()
 
     total = 0
@@ -330,8 +430,11 @@ def compute_weekly(conn, now=None):
         by_model[_model_family(r["model"])] += t
 
     return {
-        "window_start": week_ago.isoformat(),
+        "window_start": anchor_at.isoformat(),
         "window_end": now.isoformat(),
+        "anchor_at": anchor_at.isoformat(),
+        "anchor_source": anchor_source,
+        "reset_at": reset_at.isoformat(),
         "total": total,
         "by_model": by_model,
     }
@@ -493,6 +596,9 @@ def get_limits(db_path=DB_PATH):
             "by_model_pct": {
                 k: pct(v, weekly_cap) for k, v in weekly["by_model"].items()
             },
+            "anchor_at": weekly["anchor_at"],
+            "anchor_source": weekly["anchor_source"],
+            "reset_at": weekly["reset_at"],
         },
         "session_health": warning,
         "weekly_claude_design": {
