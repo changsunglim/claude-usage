@@ -31,7 +31,9 @@ DB_PATH = Path.home() / ".claude" / "usage.db"
 PLAN_CACHE_PATH = Path.home() / ".claude" / "usage-plan-cache.json"
 PLAN_CACHE_TTL_SECONDS = 24 * 3600
 WEEKLY_ANCHOR_PATH = Path.home() / ".claude" / "usage-weekly-anchor.json"
+SESSION_ANCHOR_PATH = Path.home() / ".claude" / "usage-session-anchor.json"
 WEEKLY_WINDOW = timedelta(days=7)
+SESSION_WINDOW = timedelta(hours=5)
 
 # Approximate per-plan budgets. Source: Anthropic public docs + community
 # observation. Token figures are rough — used for progress bars only.
@@ -252,6 +254,47 @@ def compute_session_5h(conn, now=None):
     now = now or datetime.now(timezone.utc)
     five_h = timedelta(hours=5)
 
+    # Manual override: if user set an explicit session anchor (e.g. because
+    # local JSONL disagrees with `claude /usage`), honor it until expiry.
+    override = _load_session_anchor()
+    if override:
+        try:
+            ov_anchor = datetime.fromisoformat(
+                override["anchor_at"].replace("Z", "+00:00")
+            )
+            ov_baseline = int(override.get("baseline_used", 0) or 0)
+            ov_source = override.get("source", "manual")
+        except (ValueError, AttributeError, KeyError):
+            ov_anchor = None
+        if ov_anchor is not None:
+            if ov_anchor + five_h <= now:
+                _clear_session_anchor()
+            else:
+                rows = conn.execute(
+                    "SELECT model, input_tokens, output_tokens, "
+                    "       cache_creation_tokens, cache_read_tokens "
+                    "FROM turns WHERE timestamp >= ? "
+                    "ORDER BY timestamp ASC",
+                    (ov_anchor.isoformat(),),
+                ).fetchall()
+                delta = 0
+                by_model = {}
+                for r in rows:
+                    t = _billable(r)
+                    delta += t
+                    fam = _model_family(r["model"])
+                    by_model[fam] = by_model.get(fam, 0) + t
+                return {
+                    "active": True,
+                    "used_tokens": ov_baseline + delta,
+                    "baseline_used": ov_baseline,
+                    "turns": len(rows),
+                    "anchor_at": ov_anchor.isoformat(),
+                    "anchor_source": ov_source,
+                    "reset_at": (ov_anchor + five_h).isoformat(),
+                    "by_model": by_model,
+                }
+
     rows = conn.execute(
         "SELECT timestamp, model, input_tokens, output_tokens, "
         "       cache_creation_tokens, cache_read_tokens "
@@ -265,8 +308,10 @@ def compute_session_5h(conn, now=None):
         return {
             "active": False,
             "used_tokens": 0,
+            "baseline_used": 0,
             "turns": 0,
             "anchor_at": None,
+            "anchor_source": "auto",
             "reset_at": None,
             "by_model": {},
         }
@@ -293,8 +338,9 @@ def compute_session_5h(conn, now=None):
 
     if anchor_ts is None:
         return {
-            "active": False, "used_tokens": 0, "turns": 0,
-            "anchor_at": None, "reset_at": None, "by_model": {},
+            "active": False, "used_tokens": 0, "baseline_used": 0, "turns": 0,
+            "anchor_at": None, "anchor_source": "auto",
+            "reset_at": None, "by_model": {},
         }
 
     reset_at = anchor_ts + five_h
@@ -303,8 +349,10 @@ def compute_session_5h(conn, now=None):
     return {
         "active": active,
         "used_tokens": used,
+        "baseline_used": 0,
         "turns": turns,
         "anchor_at": anchor_ts.isoformat(),
+        "anchor_source": "auto",
         "reset_at": reset_at.isoformat(),
         "by_model": by_model,
     }
@@ -322,25 +370,78 @@ def _load_weekly_anchor():
     return None
 
 
-def _save_weekly_anchor(anchor_at, source):
+def _save_weekly_anchor(anchor_at, source, baseline_used=0):
     """Persist weekly anchor to disk."""
     try:
         WEEKLY_ANCHOR_PATH.parent.mkdir(parents=True, exist_ok=True)
         with open(WEEKLY_ANCHOR_PATH, "w") as f:
             json.dump(
-                {"anchor_at": anchor_at.isoformat(), "source": source},
+                {
+                    "anchor_at": anchor_at.isoformat(),
+                    "source": source,
+                    "baseline_used": int(baseline_used or 0),
+                },
                 f,
             )
     except OSError:
         pass
 
 
-def set_weekly_anchor(now=None):
-    """Manually set weekly anchor to `now`. Called when user confirms a
-    fresh reset in Claude Settings → Usage."""
-    now = now or datetime.now(timezone.utc)
-    _save_weekly_anchor(now, "manual")
-    return now
+def set_weekly_anchor(anchor_at=None, baseline_used=0, source="manual"):
+    """Manually set weekly anchor. `baseline_used` is the token count
+    already consumed in the current window at the moment of `anchor_at`
+    (derived from the percent the user reads off Claude Settings → Usage).
+    """
+    anchor_at = anchor_at or datetime.now(timezone.utc)
+    _save_weekly_anchor(anchor_at, source, baseline_used)
+    return anchor_at
+
+
+def _save_session_anchor(anchor_at, source, baseline_used=0):
+    try:
+        SESSION_ANCHOR_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(SESSION_ANCHOR_PATH, "w") as f:
+            json.dump(
+                {
+                    "anchor_at": anchor_at.isoformat(),
+                    "source": source,
+                    "baseline_used": int(baseline_used or 0),
+                },
+                f,
+            )
+    except OSError:
+        pass
+
+
+def _load_session_anchor():
+    try:
+        with open(SESSION_ANCHOR_PATH, "r") as f:
+            data = json.load(f)
+        if "anchor_at" in data:
+            return data
+    except (OSError, json.JSONDecodeError):
+        pass
+    return None
+
+
+def _clear_session_anchor():
+    try:
+        SESSION_ANCHOR_PATH.unlink()
+    except OSError:
+        pass
+
+
+def clear_session_anchor():
+    """Remove manual session anchor override."""
+    _clear_session_anchor()
+
+
+def set_session_anchor(anchor_at=None, baseline_used=0, source="manual"):
+    """Manually set 5h session anchor and optional baseline token count.
+    Used when local JSONL disagrees with `claude /usage`."""
+    anchor_at = anchor_at or datetime.now(timezone.utc)
+    _save_session_anchor(anchor_at, source, baseline_used)
+    return anchor_at
 
 
 def _earliest_turn_ts(conn, since):
@@ -358,21 +459,19 @@ def _earliest_turn_ts(conn, since):
 
 
 def _resolve_weekly_anchor(conn, now):
-    """Return (anchor_at: datetime, source: str).
+    """Return (anchor_at, source, baseline_used).
 
     Strategy:
-      1. Load persisted anchor. If it's still within its 7d window
-         (anchor + 7d > now), use it as-is.
-      2. If persisted anchor has expired, auto-advance: find the
-         first turn at-or-after anchor + 7d and treat that as the
-         new anchor (this is when the user reopened Claude after
-         Anthropic's reset). Persist as auto.
-      3. If no persisted anchor, fall back to the earliest turn in
-         the last 7 days (best-effort approximation). Persist as auto.
+      1. Load persisted anchor. If still within window (anchor + 7d > now),
+         use it as-is including baseline_used.
+      2. If expired, auto-advance: find first turn at-or-after anchor + 7d
+         and treat as new anchor; baseline_used resets to 0.
+      3. If no persisted anchor, fall back to earliest turn in last 7d.
     """
     persisted = _load_weekly_anchor()
     anchor = None
     source = "auto"
+    baseline = 0
 
     if persisted:
         try:
@@ -380,26 +479,28 @@ def _resolve_weekly_anchor(conn, now):
                 persisted["anchor_at"].replace("Z", "+00:00")
             )
             source = persisted.get("source", "auto")
+            baseline = int(persisted.get("baseline_used", 0) or 0)
         except (ValueError, AttributeError, KeyError):
             anchor = None
 
     if anchor is None:
         fallback = _earliest_turn_ts(conn, now - WEEKLY_WINDOW)
         anchor = fallback or now
-        _save_weekly_anchor(anchor, "auto")
-        return anchor, "auto"
+        _save_weekly_anchor(anchor, "auto", 0)
+        return anchor, "auto", 0
 
+    advanced = False
     while anchor + WEEKLY_WINDOW <= now:
         next_window_start = anchor + WEEKLY_WINDOW
         next_anchor = _earliest_turn_ts(conn, next_window_start)
-        if next_anchor is None:
-            anchor = next_window_start
-        else:
-            anchor = next_anchor
+        anchor = next_anchor if next_anchor else next_window_start
         source = "auto"
+        baseline = 0
+        advanced = True
 
-    _save_weekly_anchor(anchor, source)
-    return anchor, source
+    if advanced:
+        _save_weekly_anchor(anchor, source, baseline)
+    return anchor, source, baseline
 
 
 def compute_weekly(conn, now=None):
@@ -412,7 +513,7 @@ def compute_weekly(conn, now=None):
     see a fresh 0% in Claude Settings → Usage.
     """
     now = now or datetime.now(timezone.utc)
-    anchor_at, anchor_source = _resolve_weekly_anchor(conn, now)
+    anchor_at, anchor_source, baseline = _resolve_weekly_anchor(conn, now)
     reset_at = anchor_at + WEEKLY_WINDOW
 
     rows = conn.execute(
@@ -422,18 +523,21 @@ def compute_weekly(conn, now=None):
         (anchor_at.isoformat(),),
     ).fetchall()
 
-    total = 0
+    delta = 0
     by_model = {"opus": 0, "sonnet": 0, "haiku": 0, "other": 0}
     for r in rows:
         t = _billable(r)
-        total += t
+        delta += t
         by_model[_model_family(r["model"])] += t
+
+    total = baseline + delta
 
     return {
         "window_start": anchor_at.isoformat(),
         "window_end": now.isoformat(),
         "anchor_at": anchor_at.isoformat(),
         "anchor_source": anchor_source,
+        "baseline_used": baseline,
         "reset_at": reset_at.isoformat(),
         "total": total,
         "by_model": by_model,
@@ -584,6 +688,8 @@ def get_limits(db_path=DB_PATH):
             "percent": pct(session_used, session_cap),
             "turns": session["turns"],
             "anchor_at": session["anchor_at"],
+            "anchor_source": session.get("anchor_source", "auto"),
+            "baseline_used": session.get("baseline_used", 0),
             "reset_at": session["reset_at"],
             "by_model": session["by_model"],
         },
@@ -598,6 +704,7 @@ def get_limits(db_path=DB_PATH):
             },
             "anchor_at": weekly["anchor_at"],
             "anchor_source": weekly["anchor_source"],
+            "baseline_used": weekly.get("baseline_used", 0),
             "reset_at": weekly["reset_at"],
         },
         "session_health": warning,

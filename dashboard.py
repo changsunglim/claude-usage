@@ -553,12 +553,56 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div class="lc-bar"><div class="lc-fill"></div></div>
     <div class="lc-foot"><span class="lc-used">— / —</span><span class="lc-reset" id="lc-weekly-reset">—</span></div>
     <div class="lc-models" id="lc-weekly-models"></div>
-    <div class="lc-sync" style="margin-top:6px;font-size:11px;opacity:0.75">
+    <div class="lc-sync" style="margin-top:6px;font-size:11px;opacity:0.85">
       <button id="lc-weekly-sync" class="filter-btn" style="padding:2px 8px;font-size:11px"
-        title="Click after you see a fresh 0% in Claude Settings → Usage. Resets the local anchor to now so the bar tracks Anthropic's actual reset.">
+        title="Click right after you see a fresh 0% in Claude Settings → Usage.">
         Sync reset to now
       </button>
-      <span id="lc-weekly-anchor-src" style="margin-left:8px"></span>
+      <button id="lc-weekly-edit" class="filter-btn" style="padding:2px 8px;font-size:11px;margin-left:4px"
+        title="Manually edit anchor time and current percent if you missed the sync moment.">
+        Edit…
+      </button>
+      <div id="lc-weekly-edit-form" style="display:none;margin-top:6px;padding:6px;border:1px solid #2a3142;border-radius:4px">
+        <label style="display:block;margin-bottom:4px">Anchor (last reset time):
+          <input id="lc-weekly-anchor-input" type="datetime-local" style="background:#1a1f2c;color:#e8ecf3;border:1px solid #2a3142;padding:2px 4px;font-size:11px">
+        </label>
+        <label style="display:block;margin-bottom:4px">Used % at that moment (from Claude Settings → Usage):
+          <input id="lc-weekly-percent-input" type="number" min="0" max="100" step="0.1" placeholder="0" style="width:60px;background:#1a1f2c;color:#e8ecf3;border:1px solid #2a3142;padding:2px 4px;font-size:11px">
+        </label>
+        <button id="lc-weekly-save" class="filter-btn" style="padding:2px 8px;font-size:11px">Save</button>
+        <button id="lc-weekly-cancel" class="filter-btn" style="padding:2px 8px;font-size:11px;margin-left:4px">Cancel</button>
+      </div>
+      <div id="lc-weekly-anchor-src" style="margin-top:4px;opacity:0.7"></div>
+    </div>
+  </div>
+  <div class="limit-card" id="lc-session">
+    <div class="lc-head"><span>Session · 5h</span><span class="lc-pct">—</span></div>
+    <div class="lc-bar"><div class="lc-fill"></div></div>
+    <div class="lc-foot"><span class="lc-used">— / —</span><span class="lc-reset" id="lc-session-reset">—</span></div>
+    <div class="lc-sync" style="margin-top:6px;font-size:11px;opacity:0.85">
+      <button id="lc-session-sync" class="filter-btn" style="padding:2px 8px;font-size:11px"
+        title="Click right after you see a fresh 0% session window in claude /usage.">
+        Sync reset to now
+      </button>
+      <button id="lc-session-edit" class="filter-btn" style="padding:2px 8px;font-size:11px;margin-left:4px"
+        title="Manually edit session anchor and current percent.">
+        Edit…
+      </button>
+      <button id="lc-session-clear" class="filter-btn" style="padding:2px 8px;font-size:11px;margin-left:4px"
+        title="Clear manual override and return to auto-detection.">
+        Clear
+      </button>
+      <div id="lc-session-edit-form" style="display:none;margin-top:6px;padding:6px;border:1px solid #2a3142;border-radius:4px">
+        <label style="display:block;margin-bottom:4px">Anchor (session start):
+          <input id="lc-session-anchor-input" type="datetime-local" style="background:#1a1f2c;color:#e8ecf3;border:1px solid #2a3142;padding:2px 4px;font-size:11px">
+        </label>
+        <label style="display:block;margin-bottom:4px">Used % at that moment:
+          <input id="lc-session-percent-input" type="number" min="0" max="100" step="0.1" placeholder="0" style="width:60px;background:#1a1f2c;color:#e8ecf3;border:1px solid #2a3142;padding:2px 4px;font-size:11px">
+        </label>
+        <button id="lc-session-save" class="filter-btn" style="padding:2px 8px;font-size:11px">Save</button>
+        <button id="lc-session-cancel" class="filter-btn" style="padding:2px 8px;font-size:11px;margin-left:4px">Cancel</button>
+      </div>
+      <div id="lc-session-anchor-src" style="margin-top:4px;opacity:0.7"></div>
     </div>
   </div>
   <div id="lc-health" class="health-ok">
@@ -1903,24 +1947,90 @@ function renderWeeklyBar(wk) {
     srcEl.textContent = `anchor: ${anchorTxt} (${src})`;
   }
 }
-async function syncWeeklyReset() {
-  const btn = document.getElementById('lc-weekly-sync');
-  if (!btn) return;
-  if (!confirm('Set the weekly reset anchor to NOW?\\n\\nOnly click this right after you see a fresh 0% in Claude Settings → Usage. This tells the dashboard that Anthropic just reset your weekly limit.')) return;
-  btn.disabled = true; btn.textContent = 'Syncing…';
-  try {
-    const r = await fetch('/api/weekly/sync-reset', { method: 'POST' });
-    if (!r.ok) throw new Error('sync failed');
-    await loadLimits();
-  } catch (e) {
-    alert('Sync failed: ' + e.message);
-  } finally {
-    btn.disabled = false; btn.textContent = 'Sync reset to now';
+async function postAnchor(kind, body) {
+  const url = kind === 'weekly' ? '/api/weekly/sync-reset' : '/api/session/sync-reset';
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body || {}),
+  });
+  if (!r.ok) throw new Error('sync failed');
+  await loadLimits();
+}
+function toIsoUtc(localStr) {
+  if (!localStr) return new Date().toISOString();
+  // datetime-local gives "YYYY-MM-DDTHH:MM" in local time
+  return new Date(localStr).toISOString();
+}
+function wireAnchorCard(kind) {
+  const sync = document.getElementById('lc-' + kind + '-sync');
+  const edit = document.getElementById('lc-' + kind + '-edit');
+  const save = document.getElementById('lc-' + kind + '-save');
+  const cancel = document.getElementById('lc-' + kind + '-cancel');
+  const clear = document.getElementById('lc-' + kind + '-clear');
+  const form = document.getElementById('lc-' + kind + '-edit-form');
+  const anchorInput = document.getElementById('lc-' + kind + '-anchor-input');
+  const percentInput = document.getElementById('lc-' + kind + '-percent-input');
+  if (sync) sync.addEventListener('click', async () => {
+    const label = kind === 'weekly' ? 'weekly' : '5h session';
+    if (!confirm(`Set the ${label} reset anchor to NOW?\\n\\nOnly click after Claude shows a fresh 0%.`)) return;
+    sync.disabled = true; sync.textContent = 'Syncing…';
+    try { await postAnchor(kind, {}); }
+    catch (e) { alert('Failed: ' + e.message); }
+    finally { sync.disabled = false; sync.textContent = 'Sync reset to now'; }
+  });
+  if (edit) edit.addEventListener('click', () => {
+    if (form) form.style.display = form.style.display === 'none' ? 'block' : 'none';
+    if (anchorInput && !anchorInput.value) {
+      const d = new Date();
+      const pad = n => String(n).padStart(2, '0');
+      anchorInput.value = `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    }
+  });
+  if (cancel) cancel.addEventListener('click', () => { if (form) form.style.display = 'none'; });
+  if (save) save.addEventListener('click', async () => {
+    const payload = {
+      anchor_at: toIsoUtc(anchorInput && anchorInput.value),
+      percent: percentInput && percentInput.value ? parseFloat(percentInput.value) : 0,
+    };
+    save.disabled = true; save.textContent = 'Saving…';
+    try {
+      await postAnchor(kind, payload);
+      if (form) form.style.display = 'none';
+    } catch (e) { alert('Failed: ' + e.message); }
+    finally { save.disabled = false; save.textContent = 'Save'; }
+  });
+  if (clear) clear.addEventListener('click', async () => {
+    if (!confirm('Clear manual override and return to auto-detection?')) return;
+    try { await postAnchor(kind, {clear: true}); }
+    catch (e) { alert('Failed: ' + e.message); }
+  });
+}
+function renderSessionBar(s) {
+  const el = document.getElementById('lc-session');
+  if (!el) return;
+  const bar = el.querySelector('.lc-bar');
+  const pctEl = el.querySelector('.lc-pct');
+  const usedEl = el.querySelector('.lc-used');
+  const cap = s.cap || 0;
+  const used = s.used || 0;
+  const p = s.percent == null ? 0 : s.percent;
+  pctEl.textContent = p.toFixed(1) + '%';
+  usedEl.innerHTML = '<strong>' + fmtTokens(used) + '</strong> / ' + fmtTokens(cap);
+  const fillPct = Math.min(100, cap > 0 ? (used / cap) * 100 : 0);
+  bar.innerHTML = `<div class="lc-fill" style="width:${fillPct}%"></div>`;
+  const resetEl = document.getElementById('lc-session-reset');
+  if (resetEl) resetEl.textContent = s.reset_at ? fmtCountdown(s.reset_at) : '—';
+  const srcEl = document.getElementById('lc-session-anchor-src');
+  if (srcEl) {
+    const src = s.anchor_source || 'auto';
+    const anchorTxt = s.anchor_at ? new Date(s.anchor_at).toLocaleString() : '—';
+    srcEl.textContent = `anchor: ${anchorTxt} (${src})`;
   }
 }
 document.addEventListener('DOMContentLoaded', () => {
-  const b = document.getElementById('lc-weekly-sync');
-  if (b) b.addEventListener('click', syncWeeklyReset);
+  wireAnchorCard('weekly');
+  wireAnchorCard('session');
 });
 function renderWeeklyModels(wk) {
   const host = document.getElementById('lc-weekly-models');
@@ -1985,6 +2095,7 @@ async function loadLimits() {
     const wk = data.weekly_all || {};
     renderWeeklyBar(wk);
     renderWeeklyModels(wk);
+    renderSessionBar(data.session_5h || {});
     renderHealth(data.session_health || {});
   } catch (e) { /* network blip */ }
 }
@@ -2071,10 +2182,64 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def do_POST(self):
-        if self.path == "/api/weekly/sync-reset":
-            from limits import set_weekly_anchor
-            anchor = set_weekly_anchor()
-            body = json.dumps({"anchor_at": anchor.isoformat()}).encode("utf-8")
+        if self.path in ("/api/weekly/sync-reset", "/api/session/sync-reset"):
+            from limits import (
+                set_weekly_anchor, set_session_anchor,
+                clear_session_anchor, detect_plan,
+            )
+            length = int(self.headers.get("Content-Length", "0") or 0)
+            payload = {}
+            if length:
+                try:
+                    payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    payload = {}
+
+            anchor_at = None
+            if payload.get("anchor_at"):
+                try:
+                    anchor_at = datetime.fromisoformat(
+                        str(payload["anchor_at"]).replace("Z", "+00:00")
+                    )
+                    if anchor_at.tzinfo is None:
+                        anchor_at = anchor_at.replace(tzinfo=timezone.utc)
+                except (ValueError, AttributeError):
+                    anchor_at = None
+
+            is_weekly = self.path == "/api/weekly/sync-reset"
+            if payload.get("clear"):
+                if not is_weekly:
+                    clear_session_anchor()
+                body = json.dumps({"cleared": True}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            budgets = detect_plan()["budgets"]
+            cap = budgets["weekly_all_tokens"] if is_weekly else budgets["session_5h_tokens"]
+            baseline = 0
+            if payload.get("baseline_used") is not None:
+                try:
+                    baseline = max(0, int(payload["baseline_used"]))
+                except (TypeError, ValueError):
+                    baseline = 0
+            elif payload.get("percent") is not None:
+                try:
+                    baseline = max(0, int(round(float(payload["percent"]) / 100.0 * cap)))
+                except (TypeError, ValueError):
+                    baseline = 0
+
+            if is_weekly:
+                anchor = set_weekly_anchor(anchor_at, baseline_used=baseline)
+            else:
+                anchor = set_session_anchor(anchor_at, baseline_used=baseline)
+
+            body = json.dumps({
+                "anchor_at": anchor.isoformat(),
+                "baseline_used": baseline,
+            }).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))

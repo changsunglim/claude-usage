@@ -85,7 +85,7 @@ class TestWeeklyAnchor(unittest.TestCase):
 
     def test_manual_anchor_persists(self):
         now = datetime(2026, 5, 27, 12, 0, tzinfo=timezone.utc)
-        limits.set_weekly_anchor(now=now)
+        limits.set_weekly_anchor(anchor_at=now)
         _add_turns(self.conn, "s1", "p", [
             ((now - timedelta(days=2)).isoformat(), 5000),  # before anchor
             ((now + timedelta(hours=1)).isoformat(), 7000),  # after anchor
@@ -96,7 +96,7 @@ class TestWeeklyAnchor(unittest.TestCase):
 
     def test_auto_advance_after_expiry(self):
         t0 = datetime(2026, 5, 1, 0, 0, tzinfo=timezone.utc)
-        limits.set_weekly_anchor(now=t0)
+        limits.set_weekly_anchor(anchor_at=t0)
         # mark anchor as manual; auto-advance should still bump it
         # 8 days later: first turn after expiry is at t0+7d+2h
         next_turn = t0 + timedelta(days=7, hours=2)
@@ -110,9 +110,19 @@ class TestWeeklyAnchor(unittest.TestCase):
         self.assertEqual(anchor, next_turn)
         self.assertEqual(result["total"], 3000)
 
+    def test_baseline_used_added_to_total(self):
+        now = datetime(2026, 5, 27, 12, 0, tzinfo=timezone.utc)
+        limits.set_weekly_anchor(anchor_at=now, baseline_used=10_000_000)
+        _add_turns(self.conn, "s1", "p", [
+            ((now + timedelta(hours=1)).isoformat(), 500_000),
+        ])
+        result = limits.compute_weekly(self.conn, now=now + timedelta(hours=2))
+        self.assertEqual(result["baseline_used"], 10_000_000)
+        self.assertEqual(result["total"], 10_500_000)
+
     def test_reset_at_equals_anchor_plus_7d(self):
         now = datetime(2026, 5, 27, 12, 0, tzinfo=timezone.utc)
-        anchor = limits.set_weekly_anchor(now=now)
+        anchor = limits.set_weekly_anchor(anchor_at=now)
         result = limits.compute_weekly(self.conn, now=now)
         reset = datetime.fromisoformat(result["reset_at"])
         self.assertEqual(reset - anchor, timedelta(days=7))
