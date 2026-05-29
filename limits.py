@@ -255,12 +255,12 @@ def _save_weekly_anchor(anchor_at, source, baseline_used=0, save_at=None):
 def set_weekly_anchor(anchor_at=None, baseline_used=0, source="manual",
                       save_at=None):
     """Manually set weekly anchor. `baseline_used` is the token count
-    already consumed at the moment of `save_at` (or `anchor_at` if save_at
-    is None). Delta accumulates from save_at forward to avoid double-counting
-    turns between anchor_at and save_at."""
+    already consumed at the moment of `save_at`. When `save_at` is set,
+    delta accumulates from save_at forward to avoid double-counting turns
+    between anchor_at and save_at. When `save_at` is None, delta starts
+    from anchor_at (legacy behavior — callers managing manual percent
+    overrides should pass save_at=now() to prevent double-count)."""
     anchor_at = anchor_at or datetime.now(timezone.utc)
-    if save_at is None and baseline_used:
-        save_at = datetime.now(timezone.utc)
     _save_weekly_anchor(anchor_at, source, baseline_used, save_at)
     return anchor_at
 

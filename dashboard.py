@@ -2310,7 +2310,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 except (TypeError, ValueError):
                     baseline = 0
 
-            anchor = set_weekly_anchor(anchor_at, baseline_used=baseline)
+            # save_at=now whenever a non-zero baseline is supplied so the
+            # delta computation starts from the save moment, not the anchor
+            # (otherwise turns between anchor_at and now get double-counted).
+            save_at = now if baseline > 0 else None
+            anchor = set_weekly_anchor(
+                anchor_at, baseline_used=baseline, save_at=save_at,
+            )
 
             body = json.dumps({
                 "anchor_at": anchor.isoformat(),
