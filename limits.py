@@ -39,11 +39,18 @@ PLAN_BUDGETS = {
     "max_20x":{"label": "Max 20×", "weekly_all_tokens": 460_000_000},
 }
 
-# Anthropic's session/weekly limits appear to use cost-weighted tokens,
-# where cache reads count at roughly 1/10 of input. This matches API
-# pricing (cache_read = 10% of input cost) and reproduces the
-# percentages shown by `claude /usage` to within a few points.
+# Anthropic's session/weekly limits use cost-weighted tokens. Weights
+# are anchored to Sonnet input = 1.0 (matches PLAN_BUDGETS Sonnet-equiv).
+# Opus ~5× Sonnet, Haiku ~0.25×. cache_creation = 1.25× input,
+# cache_read = 0.1× input. Reproduces `claude /usage` percentages.
 CACHE_READ_WEIGHT = 0.1
+
+MODEL_WEIGHTS = {
+    "opus":   {"in": 5.0,  "out": 5.0,  "cc": 6.25,   "cr": 0.5},
+    "sonnet": {"in": 1.0,  "out": 1.0,  "cc": 1.25,   "cr": 0.1},
+    "haiku":  {"in": 0.25, "out": 0.25, "cc": 0.3125, "cr": 0.025},
+    "other":  {"in": 1.0,  "out": 1.0,  "cc": 1.25,   "cr": 0.1},
+}
 
 DEFAULT_PLAN = "pro"
 
@@ -209,14 +216,14 @@ def _model_family(model):
 
 
 def _billable(row):
-    # Weighted-token formula: matches Anthropic's `claude /usage`
-    # percentages. Cache reads are heavily discounted (~0.1×) since
-    # they're served from cache and priced accordingly.
+    # Per-model cost-weighted formula. PLAN_BUDGETS caps are in
+    # Sonnet-equivalent units, so Opus tokens count ~5× and Haiku ~0.25×.
+    w = MODEL_WEIGHTS[_model_family(row["model"])]
     return int(
-        (row["input_tokens"] or 0)
-        + (row["output_tokens"] or 0)
-        + (row["cache_creation_tokens"] or 0)
-        + (row["cache_read_tokens"] or 0) * CACHE_READ_WEIGHT
+        (row["input_tokens"] or 0) * w["in"]
+        + (row["output_tokens"] or 0) * w["out"]
+        + (row["cache_creation_tokens"] or 0) * w["cc"]
+        + (row["cache_read_tokens"] or 0) * w["cr"]
     )
 
 

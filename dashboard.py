@@ -554,6 +554,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div class="lc-bar"><div class="lc-fill"></div></div>
     <div class="lc-foot"><span class="lc-used">— / —</span><span class="lc-reset" id="lc-weekly-reset">—</span></div>
     <div class="lc-models" id="lc-weekly-models"></div>
+    <div class="lc-disclaimer" style="margin-top:6px;font-size:10px;opacity:0.6;font-style:italic">
+      Estimate may drift ±1–2pp from Claude Settings → Usage (cost-weighting heuristics; cache/model multipliers approximate). Use Sync/Edit to recalibrate.
+    </div>
     <div class="lc-sync" style="margin-top:6px;font-size:11px;opacity:0.85">
       <button id="lc-weekly-sync" class="filter-btn" style="padding:2px 8px;font-size:11px"
         title="Click right after you see a fresh 0% in Claude Settings → Usage.">

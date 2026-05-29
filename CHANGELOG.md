@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-05-29
+
+- Fix weekly model usage miscount: `_billable` now applies per-model cost weights (Opus ~5×, Sonnet 1×, Haiku ~0.25×) anchored to Sonnet-equivalent plan caps. Previously summed all model tokens 1:1, skewing the all-models bar and per-model breakdown on Opus-heavy weeks (cause of recurring manual edits)
+- `cache_creation` now weighted 1.25× input; `cache_read` stays 0.1×
+- Add accuracy disclaimer under the weekly card: estimate may drift ±1–2pp from Claude Settings → Usage; use Sync/Edit to recalibrate
+
 ## 2026-05-27
 
 - Fix weekly all-models bar not reflecting Anthropic's per-user reset: the previous rolling 7d sum drifted after Anthropic's actual reset fired
