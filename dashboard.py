@@ -4,12 +4,119 @@ dashboard.py - Local web dashboard served on localhost:8080.
 
 import json
 import os
+import re
+import glob
 import sqlite3
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 DB_PATH = Path.home() / ".claude" / "usage.db"
+
+
+def _detect_tz_offset_hours():
+    """Auto-detect system timezone offset in hours. Override with env TZ_OFFSET_HOURS."""
+    env = os.environ.get("TZ_OFFSET_HOURS")
+    if env not in (None, ""):
+        try:
+            return int(env)
+        except ValueError:
+            pass
+    try:
+        off = datetime.now().astimezone().utcoffset()
+        if off is None:
+            return 0
+        return int(off.total_seconds() // 3600)
+    except Exception:
+        return 0
+
+
+TZ_OFFSET_HOURS = _detect_tz_offset_hours()
+TZ_NAME = datetime.now().astimezone().tzname() or f"UTC{TZ_OFFSET_HOURS:+d}"
+SQL_TZ_SHIFT = f"'+{TZ_OFFSET_HOURS} hours'" if TZ_OFFSET_HOURS >= 0 else f"'{TZ_OFFSET_HOURS} hours'"
+
+PROJECTS_DIRS = [
+    Path.home() / ".claude" / "projects",
+    Path.home() / "Library" / "Developer" / "Xcode" / "CodingAssistant" / "ClaudeAgentConfig" / "projects",
+]
+
+
+def _shift_iso(ts, hours=TZ_OFFSET_HOURS):
+    if not ts:
+        return ""
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        return (dt + timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%S")
+    except Exception:
+        return ts
+
+
+_TITLE_CACHE = {}  # session_id -> (mtime, title, project_path, jsonl_path)
+
+
+def _find_session_jsonl(session_id):
+    for d in PROJECTS_DIRS:
+        if not d.exists():
+            continue
+        for p in d.rglob(f"{session_id}.jsonl"):
+            return p
+    return None
+
+
+def _extract_title(jsonl_path):
+    try:
+        with open(jsonl_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                if d.get("type") != "user":
+                    continue
+                msg = d.get("message")
+                if not isinstance(msg, dict) or msg.get("role") != "user":
+                    continue
+                c = msg.get("content")
+                text = None
+                if isinstance(c, str):
+                    text = c
+                elif isinstance(c, list):
+                    for it in c:
+                        if isinstance(it, dict) and it.get("type") == "text":
+                            text = it.get("text")
+                            break
+                if not text:
+                    continue
+                t = text.strip()
+                if t.startswith("<") or t.startswith("Caveat:") or t.startswith("[Request"):
+                    continue
+                t = " ".join(t.split())
+                return t[:80] + ("..." if len(t) > 80 else "")
+    except Exception:
+        pass
+    return ""
+
+
+def get_session_titles(session_ids):
+    out = {}
+    for sid in session_ids:
+        p = _find_session_jsonl(sid)
+        if not p:
+            out[sid] = ""
+            continue
+        try:
+            mtime = p.stat().st_mtime
+        except OSError:
+            out[sid] = ""
+            continue
+        cached = _TITLE_CACHE.get(sid)
+        if cached and cached[0] == mtime:
+            out[sid] = cached[1]
+        else:
+            title = _extract_title(p)
+            _TITLE_CACHE[sid] = (mtime, title, str(p.parent), str(p))
+            out[sid] = title
+    return out
 
 
 def get_dashboard_data(db_path=DB_PATH):
@@ -29,9 +136,9 @@ def get_dashboard_data(db_path=DB_PATH):
     all_models = [r["model"] for r in model_rows]
 
     # ── Daily per-model, ALL history (client filters by range) ────────────────
-    daily_rows = conn.execute("""
+    daily_rows = conn.execute(f"""
         SELECT
-            substr(timestamp, 1, 10)   as day,
+            substr(datetime(timestamp, {SQL_TZ_SHIFT}), 1, 10)   as day,
             COALESCE(model, 'unknown') as model,
             SUM(input_tokens)          as input,
             SUM(output_tokens)         as output,
@@ -55,10 +162,10 @@ def get_dashboard_data(db_path=DB_PATH):
 
     # ── Hourly per-day per-model (client filters by range + TZ-shifts) ────────
     # Timestamps are ISO8601 UTC (e.g. "2026-04-08T09:30:00Z"); chars 12-13 = hour.
-    hourly_rows = conn.execute("""
+    hourly_rows = conn.execute(f"""
         SELECT
-            substr(timestamp, 1, 10)                  as day,
-            CAST(substr(timestamp, 12, 2) AS INTEGER) as hour,
+            substr(datetime(timestamp, {SQL_TZ_SHIFT}), 1, 10)                  as day,
+            CAST(substr(datetime(timestamp, {SQL_TZ_SHIFT}), 12, 2) AS INTEGER) as hour,
             COALESCE(model, 'unknown')                as model,
             SUM(output_tokens)                        as output,
             COUNT(*)                                  as turns
@@ -88,6 +195,8 @@ def get_dashboard_data(db_path=DB_PATH):
     """).fetchall()
 
     sessions_all = []
+    raw_ids = [r["session_id"] for r in session_rows]
+    titles = get_session_titles(raw_ids[:50])  # title lookup limited to recent 50
     for r in session_rows:
         try:
             t1 = datetime.fromisoformat(r["first_timestamp"].replace("Z", "+00:00"))
@@ -95,12 +204,16 @@ def get_dashboard_data(db_path=DB_PATH):
             duration_min = round((t2 - t1).total_seconds() / 60, 1)
         except Exception:
             duration_min = 0
+        last_shifted = _shift_iso(r["last_timestamp"])
         sessions_all.append({
             "session_id":    r["session_id"][:8],
+            "session_id_full": r["session_id"],
+            "title":         titles.get(r["session_id"], ""),
             "project":       r["project_name"] or "unknown",
             "branch":        r["git_branch"] or "",
-            "last":          (r["last_timestamp"] or "")[:16].replace("T", " "),
-            "last_date":     (r["last_timestamp"] or "")[:10],
+            "last":          last_shifted[:16].replace("T", " "),
+            "last_date":     last_shifted[:10],
+            "last_iso":      r["last_timestamp"],
             "duration_min":  duration_min,
             "model":         r["model"] or "unknown",
             "turns":         r["turn_count"] or 0,
@@ -112,12 +225,178 @@ def get_dashboard_data(db_path=DB_PATH):
 
     conn.close()
 
+    # Project label map: prefer cleaner names. For opaque project IDs (UUIDs/paths
+    # ending in random hex), use the most recent session title.
+    project_labels = {}
+    import re as _re
+    uuid_re = _re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", _re.I)
+    for s in sessions_all:
+        proj = s["project"]
+        if proj in project_labels:
+            continue
+        looks_opaque = (
+            uuid_re.search(proj) is not None
+            or proj.count("/") > 1
+            or proj == "unknown"
+        )
+        if looks_opaque and s.get("title"):
+            project_labels[proj] = s["title"][:50]
+        else:
+            # Use basename of path
+            base = proj.rstrip("/").split("/")[-1] if "/" in proj else proj
+            project_labels[proj] = base or proj
+
     return {
         "all_models":      all_models,
         "daily_by_model":  daily_by_model,
         "hourly_by_model": hourly_by_model,
         "sessions_all":    sessions_all,
+        "project_labels":  project_labels,
+        "tz_name":         TZ_NAME,
+        "tz_offset_hours": TZ_OFFSET_HOURS,
         "generated_at":    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+def _is_real_user_message(msg):
+    """True if message is an actual human prompt (not tool_result)."""
+    if not isinstance(msg, dict):
+        return False
+    if msg.get("role") != "user":
+        return False
+    c = msg.get("content")
+    if isinstance(c, str):
+        return c.strip() != ""
+    if isinstance(c, list):
+        for it in c:
+            if isinstance(it, dict):
+                if it.get("type") == "tool_result":
+                    return False
+                if it.get("type") == "text" and it.get("text", "").strip():
+                    return True
+        return False
+    return False
+
+
+def _msg_text(msg):
+    c = msg.get("content") if isinstance(msg, dict) else None
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        parts = []
+        for it in c:
+            if isinstance(it, dict) and it.get("type") == "text":
+                parts.append(it.get("text", ""))
+        return " ".join(parts)
+    return ""
+
+
+_NOISE_TAG_RE = re.compile(
+    r"<(command-message|command-name|command-args|command-stdout|command-output|"
+    r"local-command-stdout|local-command-output|system-reminder|bash-input|bash-stdout|"
+    r"bash-stderr|user-prompt-submit-hook)\b[^>]*>.*?</\1>",
+    re.DOTALL,
+)
+
+
+def _is_noise_prompt(text):
+    """True if prompt body is only Claude Code wrapper tags (skill invocations, hook injections, system reminders)."""
+    stripped = _NOISE_TAG_RE.sub("", text or "").strip()
+    return stripped == ""
+
+
+def parse_session_messages(jsonl_path):
+    """Group turns by user message. Returns list of {prompt, timestamp, input, output, cache_read, cache_creation, model, turn_count}."""
+    groups = []
+    current = None
+    try:
+        with open(jsonl_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                t = d.get("type")
+                ts = d.get("timestamp", "")
+                msg = d.get("message")
+                if t == "user" and _is_real_user_message(msg):
+                    text = _msg_text(msg).strip()
+                    if _is_noise_prompt(text):
+                        # Skill invocations / system reminders aren't real user turns —
+                        # let following assistant tokens accumulate on prior prompt.
+                        continue
+                    text = " ".join(text.split())
+                    current = {
+                        "prompt": text[:200] + ("..." if len(text) > 200 else ""),
+                        "full_prompt": text,
+                        "timestamp": _shift_iso(ts),
+                        "input": 0,
+                        "output": 0,
+                        "cache_read": 0,
+                        "cache_creation": 0,
+                        "model": "",
+                        "turn_count": 0,
+                        "tools": [],
+                    }
+                    groups.append(current)
+                elif t == "assistant" and current is not None and isinstance(msg, dict):
+                    usage = msg.get("usage") or {}
+                    current["input"] += usage.get("input_tokens", 0) or 0
+                    current["output"] += usage.get("output_tokens", 0) or 0
+                    current["cache_read"] += usage.get("cache_read_input_tokens", 0) or 0
+                    current["cache_creation"] += usage.get("cache_creation_input_tokens", 0) or 0
+                    current["turn_count"] += 1
+                    if not current["model"]:
+                        current["model"] = msg.get("model", "") or ""
+                    c = msg.get("content")
+                    if isinstance(c, list):
+                        for it in c:
+                            if isinstance(it, dict) and it.get("type") == "tool_use":
+                                name = it.get("name", "")
+                                if name and name not in current["tools"]:
+                                    current["tools"].append(name)
+    except Exception:
+        pass
+    return groups
+
+
+def get_session_live(session_id, db_path=DB_PATH):
+    if not db_path.exists():
+        return {"error": "Database not found"}
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    # Resolve full id from prefix
+    row = conn.execute(
+        "SELECT session_id, project_name, model, turn_count, first_timestamp, last_timestamp, "
+        "total_input_tokens, total_output_tokens, total_cache_read, total_cache_creation, git_branch "
+        "FROM sessions WHERE session_id = ? OR session_id LIKE ? LIMIT 1",
+        (session_id, session_id + "%"),
+    ).fetchone()
+    if not row:
+        conn.close()
+        return {"error": f"Session not found: {session_id}"}
+    full_id = row["session_id"]
+    conn.close()
+    jsonl = _find_session_jsonl(full_id)
+    messages = parse_session_messages(jsonl) if jsonl else []
+    titles = get_session_titles([full_id])
+    return {
+        "session_id": full_id,
+        "title": titles.get(full_id, ""),
+        "project": row["project_name"] or "unknown",
+        "branch": row["git_branch"] or "",
+        "model": row["model"] or "unknown",
+        "turn_count": row["turn_count"] or 0,
+        "first": _shift_iso(row["first_timestamp"]),
+        "last": _shift_iso(row["last_timestamp"]),
+        "totals": {
+            "input": row["total_input_tokens"] or 0,
+            "output": row["total_output_tokens"] or 0,
+            "cache_read": row["total_cache_read"] or 0,
+            "cache_creation": row["total_cache_creation"] or 0,
+        },
+        "messages": messages,
+        "generated_at": (datetime.utcnow() + timedelta(hours=TZ_OFFSET_HOURS)).strftime("%Y-%m-%d %H:%M:%S"),
     }
 
 
@@ -147,6 +426,33 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   header .meta { color: var(--muted); font-size: 12px; }
   #rescan-btn { background: var(--card); border: 1px solid var(--border); color: var(--muted); padding: 4px 12px; border-radius: 6px; cursor: pointer; font-size: 12px; margin-top: 4px; }
   #rescan-btn:hover { color: var(--text); border-color: var(--accent); }
+
+  /* Live limits banner */
+  #limits-banner { background: var(--card); border-bottom: 1px solid var(--border); padding: 12px 24px; display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; align-items: stretch; }
+  .limit-card { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; position: relative; }
+  .limit-card .lc-head { display: flex; justify-content: space-between; align-items: baseline; font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 6px; }
+  .limit-card .lc-pct { color: var(--text); font-weight: 600; font-size: 12px; letter-spacing: 0; text-transform: none; }
+  .limit-card .lc-bar { height: 8px; background: rgba(255,255,255,0.05); border-radius: 4px; overflow: hidden; display: flex; }
+  .limit-card .lc-fill { height: 100%; width: 0%; background: var(--green); transition: width 0.4s ease, background 0.4s; }
+  .limit-card .lc-fill.warn { background: #f59e0b; }
+  .limit-card .lc-fill.danger { background: #ef4444; }
+  .limit-card .lc-seg { height: 100%; transition: width 0.4s ease; }
+  .limit-card .lc-foot { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); margin-top: 6px; }
+  .limit-card .lc-foot strong { color: var(--text); font-weight: 600; }
+  .lc-models { display: flex; gap: 10px; margin-top: 6px; font-size: 10px; color: var(--muted); flex-wrap: wrap; }
+  .lc-models .lc-model { display: inline-flex; align-items: center; gap: 4px; }
+  .lc-models .lc-swatch { width: 8px; height: 8px; border-radius: 2px; display: inline-block; }
+  #lc-health { padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; font-size: 12px; line-height: 1.4; }
+  #lc-health.health-ok { border-color: rgba(74,222,128,0.3); }
+  #lc-health.health-info { border-color: #f59e0b; background: rgba(245,158,11,0.06); }
+  #lc-health.health-warn { border-color: #ef4444; background: rgba(239,68,68,0.08); }
+  #lc-health .lc-head { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 6px; }
+  #lc-health .lc-msg { color: var(--text); }
+  #lc-health.health-ok .lc-msg { color: var(--muted); }
+  #lc-health .lc-stats { font-size: 10px; color: var(--muted); margin-top: 6px; display: flex; gap: 10px; flex-wrap: wrap; }
+  #limits-meta { padding: 6px 24px 0; font-size: 11px; color: var(--muted); display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; align-items: center; }
+  #plan-select { background: var(--card); border: 1px solid var(--border); color: var(--text); border-radius: 4px; padding: 2px 6px; font-size: 11px; }
+  .lc-disabled { opacity: 0.5; }
   #rescan-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
   #filter-bar { background: var(--card); border-bottom: 1px solid var(--border); padding: 10px 24px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
@@ -227,6 +533,60 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <button id="rescan-btn" onclick="triggerRescan()" title="Rebuild the database from scratch by re-scanning all JSONL files. Use if data looks stale or costs seem wrong.">&#x21bb; Rescan</button>
 </header>
 
+<div id="limits-meta">
+  <div>
+    Plan:
+    <select id="plan-select" onchange="onPlanOverride()">
+      <option value="">Auto-detect</option>
+      <option value="pro">Pro</option>
+      <option value="max_5x">Max 5×</option>
+      <option value="max_20x">Max 20×</option>
+    </select>
+    <span id="plan-source" style="margin-left:8px"></span>
+  </div>
+  <div title="Local JSONL only tracks Claude Code usage. Claude.ai web (incl. Claude Design) shares the same plan quota but is invisible here.">
+    Local Claude Code usage only · web usage not trackable locally
+  </div>
+</div>
+<div id="limits-banner">
+  <div class="limit-card" id="lc-weekly">
+    <div class="lc-head"><span>Weekly · All Models</span><span class="lc-pct">—</span></div>
+    <div class="lc-bar"><div class="lc-fill"></div></div>
+    <div class="lc-foot"><span class="lc-used">— / —</span><span class="lc-reset" id="lc-weekly-reset">—</span></div>
+    <div class="lc-models" id="lc-weekly-models"></div>
+    <div class="lc-sync" style="margin-top:6px;font-size:11px;opacity:0.85">
+      <button id="lc-weekly-sync" class="filter-btn" style="padding:2px 8px;font-size:11px"
+        title="Click right after you see a fresh 0% in Claude Settings → Usage.">
+        Sync reset to now
+      </button>
+      <button id="lc-weekly-edit" class="filter-btn" style="padding:2px 8px;font-size:11px;margin-left:4px"
+        title="Manually edit anchor time and current percent if you missed the sync moment.">
+        Edit…
+      </button>
+      <button id="lc-weekly-clear" class="filter-btn" style="padding:2px 8px;font-size:11px;margin-left:4px"
+        title="Clear manual override and return to auto-detection.">
+        Clear
+      </button>
+      <div id="lc-weekly-edit-form" style="display:none;margin-top:6px;padding:6px;border:1px solid #2a3142;border-radius:4px">
+        <label style="display:block;margin-bottom:4px">Anchor (last reset time):
+          <input id="lc-weekly-anchor-input" type="datetime-local" style="background:#1a1f2c;color:#e8ecf3;border:1px solid #2a3142;padding:2px 4px;font-size:11px">
+        </label>
+        <label style="display:block;margin-bottom:4px">% shown in Claude Settings right NOW (Enter=save, Esc=cancel):
+          <input id="lc-weekly-percent-input" type="number" min="0" max="100" step="0.1" placeholder="0" style="width:60px;background:#1a1f2c;color:#e8ecf3;border:1px solid #2a3142;padding:2px 4px;font-size:11px">
+        </label>
+        <button id="lc-weekly-save" class="filter-btn" style="padding:2px 8px;font-size:11px">Save</button>
+        <button id="lc-weekly-cancel" class="filter-btn" style="padding:2px 8px;font-size:11px;margin-left:4px">Cancel</button>
+      </div>
+      <div id="lc-weekly-anchor-src" style="margin-top:4px;opacity:0.7"></div>
+    </div>
+  </div>
+  <div id="lc-health" class="health-ok">
+    <div class="lc-head"><span>Session Health</span><span id="health-session-id" style="text-transform:none;letter-spacing:0">—</span></div>
+    <div class="lc-msg" id="health-msg">Loading…</div>
+    <div class="lc-stats" id="health-stats"></div>
+  </div>
+</div>
+
 <div id="filter-bar">
   <div class="filter-label">Models</div>
   <div id="model-checkboxes"></div>
@@ -242,6 +602,21 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <button class="range-btn" data-range="30d" onclick="setRange('30d')">30d</button>
     <button class="range-btn" data-range="90d" onclick="setRange('90d')">90d</button>
     <button class="range-btn" data-range="all" onclick="setRange('all')">All</button>
+    <button class="range-btn" data-range="custom" onclick="openCustomRange()"
+      title="Filter the whole dashboard to a custom rolling window (minutes/hours/days back from now).">Custom…</button>
+  </div>
+  <div id="custom-range-panel" style="display:none;margin-left:10px;padding:4px 8px;border:1px solid var(--border);border-radius:4px;background:rgba(255,255,255,0.03)">
+    <span style="font-size:11px;opacity:0.7;margin-right:6px">Last</span>
+    <input id="custom-range-amount" type="number" min="1" max="10080" step="1" value="60"
+      style="width:60px;background:#1a1f2c;color:#e8ecf3;border:1px solid #2a3142;padding:2px 4px;font-size:11px">
+    <select id="custom-range-unit"
+      style="background:#1a1f2c;color:#e8ecf3;border:1px solid #2a3142;padding:2px 4px;font-size:11px;margin-left:4px">
+      <option value="m">minutes</option>
+      <option value="h" selected>hours</option>
+      <option value="d">days</option>
+    </select>
+    <button class="filter-btn" style="padding:2px 8px;font-size:11px;margin-left:6px" onclick="applyCustomRange()">Apply</button>
+    <span style="font-size:10px;opacity:0.55;margin-left:8px">Sub-day windows filter sessions by last activity (session-level precision).</span>
   </div>
 </div>
 
@@ -267,34 +642,37 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <div class="chart-wrap"><canvas id="chart-hourly"></canvas></div>
     </div>
     <div class="chart-card">
-      <h2>By Model</h2>
-      <div class="chart-wrap"><canvas id="chart-model"></canvas></div>
+      <h2>Token Efficiency
+        <button onclick="toggleEffHelp()" title="How is this graded?" style="background:none;border:1px solid var(--border);color:var(--muted);width:18px;height:18px;border-radius:50%;font-size:11px;cursor:pointer;margin-left:6px;line-height:1;padding:0">?</button>
+        <span id="efficiency-grade" style="float:right;font-size:14px"></span>
+      </h2>
+      <div id="eff-help" style="display:none;background:rgba(255,255,255,0.03);border:1px solid var(--border);border-radius:6px;padding:10px;margin:6px 0;font-size:11px;color:var(--muted);line-height:1.5">
+        <strong style="color:var(--text)">Grade = weighted score of 4 sub-metrics over selected range:</strong>
+        <ul style="margin:6px 0 0 16px;padding:0">
+          <li><strong>Cache Hit Rate (40%):</strong> cache_read / (cache_read + cache_creation + fresh_input). Higher = more reuse.</li>
+          <li><strong>Reuse Ratio (25%):</strong> cache_read / cache_creation. 4×+ = full credit. &lt;1× = wasted writes.</li>
+          <li><strong>Output Discipline (15%):</strong> penalty if output / total_input &gt; ~30%. Chatty responses hurt.</li>
+          <li><strong>Cost Efficiency (20%):</strong> 1 - actual_cost / no_cache_cost. Uses Anthropic prices (cache_read 0.1×, cache_write 1.25×).</li>
+        </ul>
+        <div style="margin-top:6px">Updates on every dashboard refresh (every 30s). Pinned to the date range filter above — change the range, score recalcs.</div>
+      </div>
+      <div class="chart-wrap"><canvas id="chart-efficiency"></canvas></div>
     </div>
     <div class="chart-card">
       <h2>Top Projects by Tokens</h2>
       <div class="chart-wrap"><canvas id="chart-project"></canvas></div>
     </div>
   </div>
-  <div class="table-card">
-    <div class="section-title">Cost by Model</div>
-    <table>
-      <thead><tr>
-        <th>Model</th>
-        <th class="sortable" onclick="setModelSort('turns')">Turns <span class="sort-icon" id="msort-turns"></span></th>
-        <th class="sortable" onclick="setModelSort('input')">Input <span class="sort-icon" id="msort-input"></span></th>
-        <th class="sortable" onclick="setModelSort('output')">Output <span class="sort-icon" id="msort-output"></span></th>
-        <th class="sortable" onclick="setModelSort('cache_read')">Cache Read <span class="sort-icon" id="msort-cache_read"></span></th>
-        <th class="sortable" onclick="setModelSort('cache_creation')">Cache Creation <span class="sort-icon" id="msort-cache_creation"></span></th>
-        <th class="sortable" onclick="setModelSort('cost')">Est. Cost <span class="sort-icon" id="msort-cost"></span></th>
-      </tr></thead>
-      <tbody id="model-cost-body"></tbody>
-    </table>
+  <div class="table-card" id="efficiency-card">
+    <div class="section-title">Efficiency Breakdown</div>
+    <div id="efficiency-body" style="padding:14px;display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px"></div>
   </div>
   <div class="table-card">
-    <div class="section-header"><div class="section-title">Recent Sessions</div><button class="export-btn" onclick="exportSessionsCSV()" title="Export all filtered sessions to CSV">&#x2913; CSV</button></div>
+    <div class="section-header"><div class="section-title">Recent Sessions <span style="color:var(--muted);font-weight:400;font-size:11px">(click row to watch live)</span></div><button class="export-btn" onclick="exportSessionsCSV()" title="Export all filtered sessions to CSV">&#x2913; CSV</button></div>
     <table>
       <thead><tr>
         <th>Session</th>
+        <th>Title</th>
         <th>Project</th>
         <th class="sortable" onclick="setSessionSort('last')">Last Active <span class="sort-icon" id="sort-icon-last"></span></th>
         <th class="sortable" onclick="setSessionSort('duration_min')">Duration <span class="sort-icon" id="sort-icon-duration_min"></span></th>
@@ -305,6 +683,32 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <th class="sortable" onclick="setSessionSort('cost')">Est. Cost <span class="sort-icon" id="sort-icon-cost"></span></th>
       </tr></thead>
       <tbody id="sessions-body"></tbody>
+    </table>
+  </div>
+
+  <div class="table-card" id="live-session-card" style="display:none">
+    <div class="section-header">
+      <div class="section-title">Live Session: <span id="live-title" style="color:var(--muted);font-weight:400"></span></div>
+      <div>
+        <span id="live-status" style="color:var(--green);font-size:11px;margin-right:8px">&#x25CF; polling 5s</span>
+        <button class="export-btn" onclick="stopLiveSession()">Close</button>
+      </div>
+    </div>
+    <div id="live-summary" style="padding:10px 14px;color:var(--muted);font-size:12px;border-bottom:1px solid var(--border)"></div>
+    <table>
+      <thead><tr>
+        <th style="width:50px">#</th>
+        <th>Time <span id="live-tz-label" class="muted" style="font-weight:normal">(local)</span></th>
+        <th>Your Message</th>
+        <th class="num">Turns</th>
+        <th class="num">Tools</th>
+        <th class="num">Input</th>
+        <th class="num">Output</th>
+        <th class="num">Cache R</th>
+        <th class="num">Cache W</th>
+        <th class="num">Cost</th>
+      </tr></thead>
+      <tbody id="live-turns-body"></tbody>
     </table>
   </div>
   <div class="table-card">
@@ -484,9 +888,32 @@ const MODEL_COLORS = ['#d97757','#4f8ef7','#4ade80','#a78bfa','#fbbf24','#f472b6
 const RANGE_LABELS = { 'week': 'This Week', 'month': 'This Month', 'prev-month': 'Previous Month', '7d': 'Last 7 Days', '30d': 'Last 30 Days', '90d': 'Last 90 Days', 'all': 'All Time' };
 const RANGE_TICKS  = { 'week': 7, 'month': 15, 'prev-month': 15, '7d': 7, '30d': 15, '90d': 13, 'all': 12 };
 const VALID_RANGES = Object.keys(RANGE_LABELS);
+// Custom range stored as 'custom:<minutes>'. Default 60 min.
+let customRangeMinutes = 60;
+
+function isCustomRange(r) { return typeof r === 'string' && r.startsWith('custom:'); }
+function customRangeFromKey(r) {
+  if (!isCustomRange(r)) return null;
+  const n = parseInt(r.slice(7), 10);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+function fmtCustomLabel(mins) {
+  if (mins < 60) return `Last ${mins} min`;
+  if (mins < 1440) {
+    const h = mins / 60;
+    return `Last ${Number.isInteger(h) ? h : h.toFixed(1)} h`;
+  }
+  const d = mins / 1440;
+  return `Last ${Number.isInteger(d) ? d : d.toFixed(1)} d`;
+}
+function rangeLabel(range) {
+  if (isCustomRange(range)) return fmtCustomLabel(customRangeFromKey(range) || 60);
+  return RANGE_LABELS[range] || range;
+}
 
 function rangeIncludesToday(range) {
   if (range === 'all') return true;
+  if (isCustomRange(range)) return true;  // custom always ends at now
   const { start, end } = getRangeBounds(range);
   const today = new Date().toISOString().slice(0, 10);
   if (start && today < start) return false;
@@ -495,42 +922,94 @@ function rangeIncludesToday(range) {
 }
 
 function getRangeBounds(range) {
-  if (range === 'all') return { start: null, end: null };
+  if (range === 'all') return { start: null, end: null, startMs: null, endMs: null };
   const today = new Date();
   const iso = d => d.toISOString().slice(0, 10);
+  if (isCustomRange(range)) {
+    const mins = customRangeFromKey(range) || 60;
+    const endMs = Date.now();
+    const startMs = endMs - mins * 60 * 1000;
+    const startDate = new Date(startMs);
+    return {
+      start: iso(startDate),
+      end: null,
+      startMs: startMs,
+      endMs: endMs,
+    };
+  }
   if (range === 'week') {
     const day = today.getDay();
     const diffToMon = day === 0 ? 6 : day - 1;
     const mon = new Date(today); mon.setDate(today.getDate() - diffToMon);
     const sun = new Date(mon); sun.setDate(mon.getDate() + 6);
-    return { start: iso(mon), end: iso(sun) };
+    return { start: iso(mon), end: iso(sun), startMs: null, endMs: null };
   }
   if (range === 'month') {
     const start = new Date(today.getFullYear(), today.getMonth(), 1);
     const end = new Date(today.getFullYear(), today.getMonth() + 1, 0);
-    return { start: iso(start), end: iso(end) };
+    return { start: iso(start), end: iso(end), startMs: null, endMs: null };
   }
   if (range === 'prev-month') {
     const start = new Date(today.getFullYear(), today.getMonth() - 1, 1);
     const end = new Date(today.getFullYear(), today.getMonth(), 0);
-    return { start: iso(start), end: iso(end) };
+    return { start: iso(start), end: iso(end), startMs: null, endMs: null };
   }
   const days = range === '7d' ? 7 : range === '30d' ? 30 : 90;
   const d = new Date();
   d.setDate(d.getDate() - days);
-  return { start: iso(d), end: null };
+  return { start: iso(d), end: null, startMs: null, endMs: null };
+}
+
+function openCustomRange() {
+  const panel = document.getElementById('custom-range-panel');
+  if (!panel) return;
+  panel.style.display = '';
+  const amt = document.getElementById('custom-range-amount');
+  if (amt) amt.focus();
+}
+function applyCustomRange() {
+  const amt = parseInt(document.getElementById('custom-range-amount').value, 10);
+  const unit = document.getElementById('custom-range-unit').value;
+  if (!Number.isFinite(amt) || amt < 1) { alert('Enter a positive number.'); return; }
+  const mins = unit === 'd' ? amt * 1440 : unit === 'h' ? amt * 60 : amt;
+  if (mins > 525600) { alert('Max is 1 year.'); return; }
+  customRangeMinutes = mins;
+  setRange('custom:' + mins);
+}
+
+// Number of calendar days the selected range spans (used as denominator
+// for "average per day" charts so inactive days still count).
+function rangeCalendarDays(range, startISO, endISO) {
+  if (range === 'all') return 0;  // unknown — caller falls back to active-days
+  const MS = 86400000;
+  const today = new Date();
+  const todayISO = today.toISOString().slice(0, 10);
+  const effectiveEndISO = endISO || todayISO;
+  if (!startISO) return 0;
+  const s = new Date(startISO + 'T00:00:00Z');
+  const e = new Date(effectiveEndISO + 'T00:00:00Z');
+  return Math.max(1, Math.round((e - s) / MS) + 1);
 }
 
 function readURLRange() {
   const p = new URLSearchParams(window.location.search).get('range');
+  if (p && isCustomRange(p) && customRangeFromKey(p)) {
+    customRangeMinutes = customRangeFromKey(p);
+    return p;
+  }
   return VALID_RANGES.includes(p) ? p : '30d';
 }
 
 function setRange(range) {
   selectedRange = range;
-  document.querySelectorAll('.range-btn').forEach(btn =>
-    btn.classList.toggle('active', btn.dataset.range === range)
-  );
+  const isCustom = isCustomRange(range);
+  document.querySelectorAll('.range-btn').forEach(btn => {
+    const target = isCustom ? 'custom' : range;
+    btn.classList.toggle('active', btn.dataset.range === target);
+  });
+  // Show/hide custom panel based on whether range is custom.
+  const panel = document.getElementById('custom-range-panel');
+  if (panel) panel.style.display = isCustom ? '' : 'none';
   updateURL();
   applyFilter();
   scheduleAutoRefresh();
@@ -655,7 +1134,10 @@ function sortSessions(sessions) {
 function applyFilter() {
   if (!rawData) return;
 
-  const { start, end } = getRangeBounds(selectedRange);
+  const { start, end, startMs, endMs } = getRangeBounds(selectedRange);
+  // Sub-day custom range: daily rows are day-bucketed, so we filter sessions
+  // by minute-precision last_iso and recompute by-model totals from sessions.
+  const subDay = startMs != null && (endMs - startMs) < 86400000;
 
   // Filter daily rows by model + date range
   const filteredDaily = rawData.daily_by_model.filter(r =>
@@ -686,10 +1168,34 @@ function applyFilter() {
     m.turns          += r.turns;
   }
 
-  // Filter sessions by model + date range
-  const filteredSessions = rawData.sessions_all.filter(s =>
-    selectedModels.has(s.model) && (!start || s.last_date >= start) && (!end || s.last_date <= end)
-  );
+  // Filter sessions by model + date range (minute-precision when startMs set)
+  const filteredSessions = rawData.sessions_all.filter(s => {
+    if (!selectedModels.has(s.model)) return false;
+    if (startMs != null) {
+      const ts = s.last_iso ? Date.parse(s.last_iso) : NaN;
+      if (!Number.isFinite(ts)) return false;
+      if (ts < startMs) return false;
+      if (endMs != null && ts > endMs) return false;
+      return true;
+    }
+    if (start && s.last_date < start) return false;
+    if (end && s.last_date > end) return false;
+    return true;
+  });
+
+  if (subDay) {
+    // Rebuild byModel from session totals (daily-bucketed rows are too coarse).
+    for (const k of Object.keys(modelMap)) delete modelMap[k];
+    for (const s of filteredSessions) {
+      if (!modelMap[s.model]) modelMap[s.model] = { model: s.model, input: 0, output: 0, cache_read: 0, cache_creation: 0, turns: 0, sessions: 0 };
+      const m = modelMap[s.model];
+      m.input          += s.input;
+      m.output         += s.output;
+      m.cache_read     += s.cache_read;
+      m.cache_creation += s.cache_creation;
+      m.turns          += s.turns;
+    }
+  }
 
   // Add session counts into modelMap
   for (const s of filteredSessions) {
@@ -740,38 +1246,43 @@ function applyFilter() {
     cost:           byModel.reduce((s, m) => s + calcCost(m.model, m.input, m.output, m.cache_read, m.cache_creation), 0),
   };
 
-  // Hourly aggregation (filtered by model + range, then bucketed by UTC hour)
+  // Hourly aggregation (filtered by model + range, bucketed by local hour)
   const hourlySrc = (rawData.hourly_by_model || []).filter(r =>
-    selectedModels.has(r.model) && (!cutoff || r.day >= cutoff)
+    selectedModels.has(r.model) && (!start || r.day >= start) && (!end || r.day <= end)
   );
-  const hourlyAgg = aggregateHourly(hourlySrc, hourlyTZ);
+  const rangeDayCount = rangeCalendarDays(selectedRange, start, end);
+  const hourlyAgg = aggregateHourly(hourlySrc, hourlyTZ, rangeDayCount);
 
   // Update daily chart title
-  document.getElementById('daily-chart-title').textContent = 'Daily Token Usage \u2014 ' + RANGE_LABELS[selectedRange];
-  document.getElementById('hourly-chart-title').textContent = 'Average Hourly Distribution \u2014 ' + RANGE_LABELS[selectedRange];
+  document.getElementById('daily-chart-title').textContent = 'Daily Token Usage \u2014 ' + rangeLabel(selectedRange);
+  document.getElementById('hourly-chart-title').textContent = 'Average Hourly Distribution \u2014 ' + rangeLabel(selectedRange);
 
   renderStats(totals);
   renderDailyChart(daily);
   renderHourlyChart(hourlyAgg);
-  renderModelChart(byModel);
+  renderEfficiencyChart(totals);
   renderProjectChart(byProject);
   lastFilteredSessions = sortSessions(filteredSessions);
   lastByProject = sortProjects(byProject);
   lastByProjectBranch = sortProjectBranch(byProjectBranch);
   renderSessionsTable(lastFilteredSessions.slice(0, 20));
-  renderModelCostTable(byModel);
   renderProjectCostTable(lastByProject.slice(0, 20));
   renderProjectBranchCostTable(lastByProjectBranch.slice(0, 20));
 }
 
+function projectLabel(proj) {
+  const m = (rawData && rawData.project_labels) || {};
+  return m[proj] || proj;
+}
+
 // ── Renderers ──────────────────────────────────────────────────────────────
 function renderStats(t) {
-  const rangeLabel = RANGE_LABELS[selectedRange].toLowerCase();
+  const subLabel = rangeLabel(selectedRange).toLowerCase();
   const stats = [
-    { label: 'Sessions',       value: t.sessions.toLocaleString(), sub: rangeLabel },
-    { label: 'Turns',          value: fmt(t.turns),                sub: rangeLabel },
-    { label: 'Input Tokens',   value: fmt(t.input),                sub: rangeLabel },
-    { label: 'Output Tokens',  value: fmt(t.output),               sub: rangeLabel },
+    { label: 'Sessions',       value: t.sessions.toLocaleString(), sub: subLabel },
+    { label: 'Turns',          value: fmt(t.turns),                sub: subLabel },
+    { label: 'Input Tokens',   value: fmt(t.input),                sub: subLabel },
+    { label: 'Output Tokens',  value: fmt(t.output),               sub: subLabel },
     { label: 'Cache Read',     value: fmt(t.cache_read),           sub: 'from prompt cache' },
     { label: 'Cache Creation', value: fmt(t.cache_creation),       sub: 'writes to prompt cache' },
     { label: 'Est. Cost',      value: fmtCostBig(t.cost),          sub: 'API pricing, Apr 2026', color: '#4ade80' },
@@ -786,18 +1297,25 @@ function renderStats(t) {
 }
 
 // Bucket rows into 24 hours (display-TZ), summing turns + output, and count
-// the unique days in the input so the caller can compute per-day averages.
-function aggregateHourly(rows, tzMode) {
+// the calendar days in the selected range so averages divide by window size,
+// not by active-days-only.
+//
+// NOTE: server pre-applies SQL_TZ_SHIFT, so r.hour is already in local time.
+// For 'local' display, use as-is. For 'utc', subtract the local offset.
+function aggregateHourly(rows, tzMode, rangeDayCount) {
   const byHour = {};
   for (let h = 0; h < 24; h++) byHour[h] = { turns: 0, output: 0 };
   const days = new Set();
   for (const r of rows) {
-    const displayHour = utcHourToDisplay(r.hour, tzMode);
+    const displayHour = tzMode === 'local'
+      ? r.hour
+      : ((r.hour - localOffsetHours()) % 24 + 24) % 24;
     byHour[displayHour].turns  += r.turns  || 0;
     byHour[displayHour].output += r.output || 0;
     if (r.day) days.add(r.day);
   }
-  const dayCount = days.size;
+  // Prefer the range's calendar-day count; fall back to active days for 'all'.
+  const dayCount = rangeDayCount && rangeDayCount > 0 ? rangeDayCount : days.size;
   const hours = [];
   for (let h = 0; h < 24; h++) {
     hours.push({
@@ -814,7 +1332,7 @@ function aggregateHourly(rows, tzMode) {
 function renderHourlyChart(agg) {
   const dayCountEl = document.getElementById('hourly-day-count');
   dayCountEl.textContent = agg.dayCount
-    ? agg.dayCount + ' day' + (agg.dayCount === 1 ? '' : 's') + ' averaged · ' + tzDisplayName(hourlyTZ)
+    ? 'avg / day over ' + agg.dayCount + ' day' + (agg.dayCount === 1 ? '' : 's') + ' · ' + tzDisplayName(hourlyTZ)
     : 'No data · ' + tzDisplayName(hourlyTZ);
 
   const ctx = document.getElementById('chart-hourly').getContext('2d');
@@ -909,24 +1427,159 @@ function renderDailyChart(daily) {
   });
 }
 
-function renderModelChart(byModel) {
-  const ctx = document.getElementById('chart-model').getContext('2d');
+// Efficiency model (based on Anthropic prompt-caching pricing, Apr 2026):
+//   cache_write = 1.25x base input price
+//   cache_read  = 0.10x base input price
+//   output      = ~5x input price (varies by model)
+// Composite efficiency score weights 4 sub-metrics:
+//   1. Cache Hit Rate     — reused / (reused + new_input)
+//   2. Reuse Ratio        — cache_read / cache_creation (writes paying off)
+//   3. Output Discipline  — penalize runaway output vs input
+//   4. Cost Efficiency    — actual_cost / hypothetical_no_cache_cost
+function computeEfficiency(t) {
+  const reused        = t.cache_read || 0;
+  const cacheWrite    = t.cache_creation || 0;
+  const freshInput    = t.input || 0;
+  const output        = t.output || 0;
+  const newInput      = freshInput + cacheWrite;
+  const totalInput    = reused + newInput;
+
+  // 1. Cache hit rate (0–100)
+  const cacheHitPct = totalInput > 0 ? (reused / totalInput) * 100 : 0;
+
+  // 2. Reuse ratio: how many times each cached write gets read back.
+  //   2.0+ = excellent, 1.0 = breakeven (cache cost recouped), <1 = wasted writes
+  const reuseRatio = cacheWrite > 0 ? reused / cacheWrite : (reused > 0 ? 10 : 0);
+
+  // 3. Output discipline: output should be small fraction of input you fed.
+  //   Healthy range 0.05–0.3. Above 0.5 = chatty.
+  const outputRatio = totalInput > 0 ? output / totalInput : 0;
+
+  // 4. Cost vs hypothetical no-cache. Saved = cache_read * 0.9 of base input price
+  //   (since cache_read = 0.1x). cache_write = 0.25x premium over base.
+  //   Effective rate vs no-cache baseline:
+  const noCacheCost = (reused + newInput) * 1.0;                  // all at 1.0x
+  const actualCost  = reused * 0.10 + cacheWrite * 1.25 + freshInput * 1.0;
+  const costEffPct  = noCacheCost > 0 ? (1 - actualCost / noCacheCost) * 100 : 0;
+
+  // Composite score 0–100 (weighted)
+  const cacheScore  = Math.min(100, cacheHitPct);                       // weight 0.40
+  const reuseScore  = Math.min(100, reuseRatio * 25);                   // weight 0.25 (4x reuse=100)
+  const outputScore = Math.max(0, 100 - Math.min(100, outputRatio*200));// weight 0.15
+  const costScore   = Math.max(0, Math.min(100, costEffPct));           // weight 0.20
+  const composite = cacheScore*0.40 + reuseScore*0.25 + outputScore*0.15 + costScore*0.20;
+
+  let grade = 'F', color = '#ef4444';
+  if (composite >= 90)      { grade = 'A+'; color = '#22c55e'; }
+  else if (composite >= 80) { grade = 'A';  color = '#4ade80'; }
+  else if (composite >= 70) { grade = 'B';  color = '#84cc16'; }
+  else if (composite >= 60) { grade = 'C';  color = '#facc15'; }
+  else if (composite >= 50) { grade = 'D';  color = '#fb923c'; }
+
+  // $ saved estimate using blended input price ($5/M ballpark across opus/sonnet/haiku)
+  const BLENDED_INPUT_PRICE_PER_M = 5;
+  const savedUSD = (noCacheCost - actualCost) * BLENDED_INPUT_PRICE_PER_M / 1_000_000;
+
+  return {
+    reused, cacheWrite, freshInput, newInput, output, totalInput,
+    cacheHitPct, reuseRatio, outputRatio, costEffPct,
+    cacheScore, reuseScore, outputScore, costScore,
+    composite, grade, color, savedUSD,
+  };
+}
+
+function toggleEffHelp() {
+  const el = document.getElementById('eff-help');
+  if (!el) return;
+  el.style.display = el.style.display === 'none' ? 'block' : 'none';
+}
+function renderEfficiencyChart(totals) {
+  const ctx = document.getElementById('chart-efficiency').getContext('2d');
   if (charts.model) charts.model.destroy();
-  if (!byModel.length) { charts.model = null; return; }
+  const e = computeEfficiency(totals);
+  const totalEff = e.reused + e.newInput + e.output;
+  if (totalEff === 0) {
+    charts.model = null;
+    document.getElementById('efficiency-grade').textContent='';
+    renderEfficiencyBreakdown(e);
+    return;
+  }
+  document.getElementById('efficiency-grade').innerHTML =
+    `<span style="color:${e.color}">Grade ${e.grade} &middot; ${e.composite.toFixed(0)}/100</span>`;
   charts.model = new Chart(ctx, {
     type: 'doughnut',
     data: {
-      labels: byModel.map(m => m.model),
-      datasets: [{ data: byModel.map(m => m.input + m.output), backgroundColor: MODEL_COLORS, borderWidth: 2, borderColor: '#1a1d27' }]
+      labels: ['Cache Reused (0.10x price)', 'Cache Write (1.25x price)', 'Fresh Input (1.0x)', 'Output (generated)'],
+      datasets: [{
+        data: [e.reused, e.cacheWrite, e.freshInput, e.output],
+        backgroundColor: ['#22c55e', '#facc15', '#fb923c', '#4f8ef7'],
+        borderWidth: 2, borderColor: '#1a1d27'
+      }]
     },
     options: {
       responsive: true, maintainAspectRatio: false,
       plugins: {
         legend: { position: 'bottom', labels: { color: '#8892a4', boxWidth: 12, font: { size: 11 } } },
-        tooltip: { callbacks: { label: ctx => ` ${ctx.label}: ${fmt(ctx.raw)} tokens` } }
+        tooltip: { callbacks: { label: ctx => ` ${ctx.label}: ${fmt(ctx.raw)} (${((ctx.raw/totalEff)*100).toFixed(1)}%)` } }
       }
     }
   });
+  renderEfficiencyBreakdown(e);
+}
+
+function renderEfficiencyBreakdown(e) {
+  const tips = [];
+  if (e.cacheHitPct < 70) tips.push(`Cache hit rate ${e.cacheHitPct.toFixed(0)}% — keep sessions running. Each new \`claude\` session restarts cache. Cache TTL ~5 min, so flurries of activity within 5 min reuse best.`);
+  if (e.reuseRatio < 1.5 && e.cacheWrite > 0) tips.push(`Reuse ratio ${e.reuseRatio.toFixed(2)}x — cache writes barely paying off. Either you exit sessions too fast, or context churns (lots of edits invalidating cache).`);
+  if (e.outputRatio > 0.3) tips.push(`Output/input ratio ${(e.outputRatio*100).toFixed(0)}% — model generating heavy. Add "respond in under 200 words" or "report concisely" to prompts.`);
+  if (e.freshInput > 500000) tips.push(`${fmt(e.freshInput)} fresh-input tokens — files re-read often. Read specific line ranges instead of whole files.`);
+  if (e.composite >= 80) tips.push(`Strong efficiency overall. Score ${e.composite.toFixed(0)}/100.`);
+  if (!tips.length) tips.push('Solid efficiency — keep current habits.');
+
+  const subScores = [
+    { label: 'Cache Hit',       v: e.cacheHitPct.toFixed(1)+'%',           score: e.cacheScore,  weight: '40%', hint: 'reused / total input' },
+    { label: 'Reuse Ratio',     v: e.reuseRatio.toFixed(2)+'x',            score: e.reuseScore,  weight: '25%', hint: 'reads per write (4x = 100)' },
+    { label: 'Output Discipline', v: (e.outputRatio*100).toFixed(0)+'%',   score: e.outputScore, weight: '15%', hint: 'output / total input — lower better' },
+    { label: 'Cost Efficiency', v: e.costEffPct.toFixed(0)+'%',            score: e.costScore,   weight: '20%', hint: '$ saved vs no-cache baseline' },
+  ];
+
+  const headerCards = [
+    { label: 'Composite Grade',  value: e.grade,                          sub: `${e.composite.toFixed(0)}/100 weighted`,    color: e.color },
+    { label: 'Est. $ Saved',     value: '$' + e.savedUSD.toFixed(2),      sub: 'vs running without cache',                  color: '#4ade80' },
+    { label: 'Reused Tokens',    value: fmt(e.reused),                    sub: 'pulled from prompt cache' },
+    { label: 'New Input Tokens', value: fmt(e.newInput),                  sub: 'fresh + cache writes (full price)' },
+  ];
+
+  const headerHTML = headerCards.map(c => `
+    <div style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:12px">
+      <div style="color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:0.05em">${c.label}</div>
+      <div style="font-size:22px;font-weight:600;margin-top:4px;color:${c.color||'var(--text)'}">${c.value}</div>
+      <div style="color:var(--muted);font-size:11px;margin-top:2px">${c.sub}</div>
+    </div>`).join('');
+
+  const subScoreHTML = subScores.map(s => {
+    const bar = Math.max(0, Math.min(100, s.score));
+    const barColor = bar>=70?'#4ade80':bar>=50?'#facc15':'#ef4444';
+    return `
+    <div style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:12px">
+      <div style="display:flex;justify-content:space-between;align-items:baseline">
+        <span style="color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:0.05em">${s.label}</span>
+        <span class="muted" style="font-size:10px">weight ${s.weight}</span>
+      </div>
+      <div style="font-size:18px;font-weight:600;margin:4px 0;color:var(--text)">${s.v}</div>
+      <div style="height:6px;background:var(--border);border-radius:3px;overflow:hidden;margin:6px 0">
+        <div style="width:${bar}%;height:100%;background:${barColor}"></div>
+      </div>
+      <div style="color:var(--muted);font-size:11px">${s.hint}</div>
+    </div>`;
+  }).join('');
+
+  document.getElementById('efficiency-body').innerHTML =
+    headerHTML + subScoreHTML +
+    `<div style="grid-column:1/-1;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:12px">
+      <div style="color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:6px">Recommendations</div>
+      <ul style="margin:0;padding-left:20px;color:var(--text);font-size:12px;line-height:1.6">${tips.map(t=>`<li>${esc(t)}</li>`).join('')}</ul>
+    </div>`;
 }
 
 function renderProjectChart(byProject) {
@@ -937,7 +1590,7 @@ function renderProjectChart(byProject) {
   charts.project = new Chart(ctx, {
     type: 'bar',
     data: {
-      labels: top.map(p => p.project.length > 22 ? '\u2026' + p.project.slice(-20) : p.project),
+      labels: top.map(p => { const lbl = projectLabel(p.project); return lbl.length > 30 ? lbl.slice(0,28)+'\u2026' : lbl; }),
       datasets: [
         { label: 'Input',  data: top.map(p => p.input),  backgroundColor: TOKEN_COLORS.input },
         { label: 'Output', data: top.map(p => p.output), backgroundColor: TOKEN_COLORS.output },
@@ -960,8 +1613,11 @@ function renderSessionsTable(sessions) {
     const costCell = isBillable(s.model)
       ? `<td class="cost">${fmtCost(cost)}</td>`
       : `<td class="cost-na">n/a</td>`;
-    return `<tr>
+    const fullId = s.session_id_full || s.session_id;
+    const title = s.title || '<span class="muted">(no prompt)</span>';
+    return `<tr style="cursor:pointer" onclick="startLiveSession('${esc(fullId)}')">
       <td class="muted" style="font-family:monospace">${esc(s.session_id)}&hellip;</td>
+      <td>${typeof s.title === 'string' && s.title ? esc(s.title) : '<span class="muted">(no prompt)</span>'}</td>
       <td>${esc(s.project)}</td>
       <td class="muted">${esc(s.last)}</td>
       <td class="muted">${esc(s.duration_min)}m</td>
@@ -972,6 +1628,70 @@ function renderSessionsTable(sessions) {
       ${costCell}
     </tr>`;
   }).join('');
+}
+
+// ── Live session view ────────────────────────────────────────────────────────
+let liveSessionId = null;
+let liveTimer = null;
+
+function startLiveSession(sid) {
+  liveSessionId = sid;
+  document.getElementById('live-session-card').style.display = '';
+  document.getElementById('live-session-card').scrollIntoView({behavior:'smooth', block:'start'});
+  fetchLiveSession();
+  if (liveTimer) clearInterval(liveTimer);
+  liveTimer = setInterval(fetchLiveSession, 5000);
+}
+
+function stopLiveSession() {
+  liveSessionId = null;
+  if (liveTimer) { clearInterval(liveTimer); liveTimer = null; }
+  document.getElementById('live-session-card').style.display = 'none';
+}
+
+async function fetchLiveSession() {
+  if (!liveSessionId) return;
+  try {
+    const res = await fetch('/api/session/' + encodeURIComponent(liveSessionId));
+    const d = await res.json();
+    if (d.error) {
+      document.getElementById('live-summary').textContent = d.error;
+      return;
+    }
+    const cost = calcCost(d.model, d.totals.input, d.totals.output, d.totals.cache_read, d.totals.cache_creation);
+    document.getElementById('live-title').textContent = d.title || '(no prompt) — ' + d.session_id.slice(0,8);
+    document.getElementById('live-summary').innerHTML =
+      `<b>${esc(d.project)}</b> &middot; ${esc(d.model)} &middot; ${d.turn_count} turns &middot; ` +
+      `Input ${fmt(d.totals.input)} &middot; Output ${fmt(d.totals.output)} &middot; ` +
+      `Cache R/W ${fmt(d.totals.cache_read)}/${fmt(d.totals.cache_creation)} &middot; ` +
+      `<span style="color:var(--green)">Est. ${fmtCost(cost)}</span> &middot; ` +
+      `Last: ${esc((d.last||'').replace('T',' ').slice(0,19))}`;
+    const msgs = d.messages || [];
+    if (rawData && rawData.tz_name) {
+      const tzEl = document.getElementById('live-tz-label');
+      if (tzEl) tzEl.textContent = '(' + rawData.tz_name + ')';
+    }
+    const rows = msgs.slice().reverse().map((m, idx) => {
+      const realIdx = msgs.length - idx;
+      const c = calcCost(m.model || d.model, m.input, m.output, m.cache_read, m.cache_creation);
+      const tools = (m.tools||[]).join(', ');
+      return `<tr>
+        <td class="muted num">#${realIdx}</td>
+        <td class="muted" style="font-family:monospace;font-size:11px">${esc((m.timestamp||'').replace('T',' ').slice(0,19))}</td>
+        <td style="max-width:400px;white-space:normal;font-size:12px">${esc(m.prompt||'(empty)')}</td>
+        <td class="num">${m.turn_count}</td>
+        <td class="muted num" style="font-size:11px">${esc(tools)}</td>
+        <td class="num">${fmt(m.input)}</td>
+        <td class="num">${fmt(m.output)}</td>
+        <td class="num">${fmt(m.cache_read)}</td>
+        <td class="num">${fmt(m.cache_creation)}</td>
+        <td class="num cost">${fmtCost(c)}</td>
+      </tr>`;
+    }).join('');
+    document.getElementById('live-turns-body').innerHTML = rows || '<tr><td colspan="10" class="muted" style="padding:20px;text-align:center">No messages parsed</td></tr>';
+  } catch (e) {
+    document.getElementById('live-summary').textContent = 'Error: ' + e.message;
+  }
 }
 
 function setModelSort(col) {
@@ -1056,7 +1776,7 @@ function sortProjects(byProject) {
 function renderProjectCostTable(byProject) {
   document.getElementById('project-cost-body').innerHTML = sortProjects(byProject).map(p => {
     return `<tr>
-      <td>${esc(p.project)}</td>
+      <td>${esc(projectLabel(p.project))} <span class="muted" style="font-size:10px">${esc(p.project)}</span></td>
       <td class="num">${p.sessions}</td>
       <td class="num">${fmt(p.turns)}</td>
       <td class="num">${fmt(p.input)}</td>
@@ -1200,9 +1920,22 @@ async function loadData() {
     if (isFirstLoad) {
       // Restore range from URL, mark active button
       selectedRange = readURLRange();
+      const activeKey = isCustomRange(selectedRange) ? 'custom' : selectedRange;
       document.querySelectorAll('.range-btn').forEach(btn =>
-        btn.classList.toggle('active', btn.dataset.range === selectedRange)
+        btn.classList.toggle('active', btn.dataset.range === activeKey)
       );
+      if (isCustomRange(selectedRange)) {
+        const panel = document.getElementById('custom-range-panel');
+        if (panel) panel.style.display = '';
+        const amtEl = document.getElementById('custom-range-amount');
+        const unitEl = document.getElementById('custom-range-unit');
+        const m = customRangeMinutes;
+        if (amtEl && unitEl) {
+          if (m % 1440 === 0)      { amtEl.value = m / 1440; unitEl.value = 'd'; }
+          else if (m % 60 === 0)   { amtEl.value = m / 60;   unitEl.value = 'h'; }
+          else                     { amtEl.value = m;        unitEl.value = 'm'; }
+        }
+      }
       // Mark default TZ button active
       document.querySelectorAll('.tz-btn').forEach(btn =>
         btn.classList.toggle('active', btn.dataset.tz === hourlyTZ)
@@ -1231,6 +1964,227 @@ function scheduleAutoRefresh() {
 
 loadData();
 scheduleAutoRefresh();
+
+// ── Live limits banner ─────────────────────────────────────────────────────
+function fmtTokens(n) {
+  if (n == null) return '—';
+  if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'k';
+  return String(n);
+}
+function fmtCountdown(resetIso) {
+  if (!resetIso) return '—';
+  const ms = new Date(resetIso).getTime() - Date.now();
+  if (ms <= 0) return 'resets now';
+  const m = Math.floor(ms / 60000);
+  const h = Math.floor(m / 60);
+  const mm = m % 60;
+  if (h > 0) return `resets in ${h}h ${mm}m`;
+  if (m > 0) return `resets in ${m}m`;
+  return `resets in <1m`;
+}
+function applyBar(cardId, used, cap, pct, footRight) {
+  const el = document.getElementById(cardId);
+  if (!el) return;
+  const fill = el.querySelector('.lc-fill');
+  const pctEl = el.querySelector('.lc-pct');
+  const usedEl = el.querySelector('.lc-used');
+  const resetEl = el.querySelector('.lc-reset');
+  if (!cap) {
+    el.classList.add('lc-disabled');
+    fill.style.width = '0%';
+    pctEl.textContent = 'n/a';
+    usedEl.innerHTML = '<strong>' + fmtTokens(used) + '</strong> used';
+    resetEl.textContent = 'not included in plan';
+    return;
+  }
+  el.classList.remove('lc-disabled');
+  const p = pct == null ? 0 : pct;
+  fill.style.width = Math.min(100, p) + '%';
+  fill.classList.remove('warn', 'danger');
+  if (p >= 90) fill.classList.add('danger');
+  else if (p >= 70) fill.classList.add('warn');
+  pctEl.textContent = p.toFixed(1) + '%';
+  usedEl.innerHTML = '<strong>' + fmtTokens(used) + '</strong> / ' + fmtTokens(cap);
+  resetEl.textContent = footRight;
+}
+const LIMITS_MODEL_COLORS = { opus: '#d97757', sonnet: '#4f8ef7', haiku: '#4ade80', other: '#8892a4' };
+function renderWeeklyBar(wk) {
+  const el = document.getElementById('lc-weekly');
+  if (!el) return;
+  const bar = el.querySelector('.lc-bar');
+  const pctEl = el.querySelector('.lc-pct');
+  const usedEl = el.querySelector('.lc-used');
+  const cap = wk.cap || 0;
+  const used = wk.used || 0;
+  const totalPct = wk.percent == null ? 0 : wk.percent;
+  pctEl.textContent = totalPct.toFixed(1) + '%';
+  usedEl.innerHTML = '<strong>' + fmtTokens(used) + '</strong> / ' + fmtTokens(cap);
+  const order = ['opus', 'sonnet', 'haiku', 'other'];
+  const byTokens = wk.by_model || {};
+  const segs = order
+    .filter(k => (byTokens[k] || 0) > 0)
+    .map(k => {
+      const pct = cap > 0 ? (byTokens[k] / cap) * 100 : 0;
+      return `<div class="lc-seg" style="width:${pct}%;background:${LIMITS_MODEL_COLORS[k]}" title="${k}: ${fmtTokens(byTokens[k])} (${pct.toFixed(1)}%)"></div>`;
+    });
+  bar.innerHTML = segs.join('') || '<div class="lc-fill" style="width:0%"></div>';
+  const resetEl = document.getElementById('lc-weekly-reset');
+  if (resetEl) resetEl.textContent = wk.reset_at ? fmtCountdown(wk.reset_at) : '—';
+  const srcEl = document.getElementById('lc-weekly-anchor-src');
+  if (srcEl) {
+    const src = wk.anchor_source || 'auto';
+    const anchorTxt = wk.anchor_at ? new Date(wk.anchor_at).toLocaleString() : '—';
+    srcEl.textContent = `anchor: ${anchorTxt} (${src})`;
+  }
+}
+async function postWeekly(body) {
+  const r = await fetch('/api/weekly/sync-reset', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body || {}),
+  });
+  if (!r.ok) throw new Error('sync failed');
+  await loadLimits();
+}
+function toIsoUtc(localStr) {
+  if (!localStr) return new Date().toISOString();
+  return new Date(localStr).toISOString();
+}
+function wireWeeklyCard() {
+  const sync      = document.getElementById('lc-weekly-sync');
+  const edit      = document.getElementById('lc-weekly-edit');
+  const save      = document.getElementById('lc-weekly-save');
+  const cancel    = document.getElementById('lc-weekly-cancel');
+  const clear     = document.getElementById('lc-weekly-clear');
+  const form      = document.getElementById('lc-weekly-edit-form');
+  const anchorIn  = document.getElementById('lc-weekly-anchor-input');
+  const percentIn = document.getElementById('lc-weekly-percent-input');
+
+  const closeForm = () => { if (form) form.style.display = 'none'; };
+  const fillNow = () => {
+    if (!anchorIn) return;
+    const d = new Date();
+    const pad = n => String(n).padStart(2, '0');
+    anchorIn.value = `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  };
+  if (sync) sync.addEventListener('click', async () => {
+    if (!confirm('Set the weekly reset anchor to NOW?\\n\\nOnly click after Claude shows a fresh 0%.')) return;
+    sync.disabled = true; sync.textContent = 'Syncing…';
+    try { await postWeekly({}); }
+    catch (e) { alert('Failed: ' + e.message); }
+    finally { sync.disabled = false; sync.textContent = 'Sync reset to now'; }
+  });
+  if (edit) edit.addEventListener('click', () => {
+    if (!form) return;
+    const opening = form.style.display === 'none';
+    form.style.display = opening ? 'block' : 'none';
+    if (opening) { fillNow(); if (percentIn) { percentIn.value = ''; percentIn.focus(); } }
+  });
+  if (cancel) cancel.addEventListener('click', closeForm);
+  const doSave = async () => {
+    const payload = {
+      anchor_at: anchorIn && anchorIn.value ? toIsoUtc(anchorIn.value) : new Date().toISOString(),
+      percent: percentIn && percentIn.value !== '' ? parseFloat(percentIn.value) : 0,
+    };
+    if (!save) return;
+    save.disabled = true; save.textContent = 'Saving…';
+    try { await postWeekly(payload); closeForm(); }
+    catch (e) { alert('Failed: ' + e.message); }
+    finally { save.disabled = false; save.textContent = 'Save'; }
+  };
+  if (save) save.addEventListener('click', doSave);
+  [anchorIn, percentIn].forEach(inp => {
+    if (!inp) return;
+    inp.addEventListener('keydown', ev => {
+      if (ev.key === 'Enter') { ev.preventDefault(); doSave(); }
+      else if (ev.key === 'Escape') { ev.preventDefault(); closeForm(); }
+    });
+  });
+  if (clear) clear.addEventListener('click', async () => {
+    if (!confirm('Clear manual override and return to auto-detection?')) return;
+    try { await postWeekly({clear: true}); }
+    catch (e) { alert('Failed: ' + e.message); }
+  });
+}
+document.addEventListener('DOMContentLoaded', wireWeeklyCard);
+function renderWeeklyModels(wk) {
+  const host = document.getElementById('lc-weekly-models');
+  if (!host) return;
+  const byPct = wk.by_model_pct || {};
+  const byTokens = wk.by_model || {};
+  const order = ['opus', 'sonnet', 'haiku', 'other'];
+  const parts = order
+    .filter(k => (byTokens[k] || 0) > 0)
+    .map(k => `<span class="lc-model"><span class="lc-swatch" style="background:${LIMITS_MODEL_COLORS[k]}"></span>${k} ${byPct[k]||0}% · ${fmtTokens(byTokens[k]||0)}</span>`);
+  host.innerHTML = parts.join('');
+}
+function renderHealth(h) {
+  const card = document.getElementById('lc-health');
+  const msg = document.getElementById('health-msg');
+  const sid = document.getElementById('health-session-id');
+  const stats = document.getElementById('health-stats');
+  if (!card || !msg) return;
+  card.classList.remove('health-ok', 'health-info', 'health-warn');
+  if (!h.active) {
+    card.classList.add('health-ok');
+    msg.textContent = 'No active session in the last 30 minutes.';
+    sid.textContent = '—';
+    stats.innerHTML = '';
+    return;
+  }
+  card.classList.add('health-' + (h.level || 'ok'));
+  msg.textContent = h.message || '';
+  sid.textContent = h.session_id || '';
+  const parts = [];
+  if (h.context_size != null) parts.push(`context ${fmtTokens(h.context_size)}`);
+  if (h.cache_hit_rate != null) parts.push(`cache hit ${(h.cache_hit_rate*100).toFixed(0)}%`);
+  if (h.avg_billable_per_turn != null) parts.push(`avg ${fmtTokens(h.avg_billable_per_turn)}/turn`);
+  if (h.session_age_hours != null) parts.push(`age ${h.session_age_hours}h`);
+  stats.innerHTML = parts.map(p => `<span>${p}</span>`).join(' · ');
+}
+let limitsTimer = null;
+let _userPlanOverride = localStorage.getItem('claudeUsagePlanOverride') || '';
+function onPlanOverride() {
+  const v = document.getElementById('plan-select').value;
+  _userPlanOverride = v;
+  if (v) localStorage.setItem('claudeUsagePlanOverride', v);
+  else localStorage.removeItem('claudeUsagePlanOverride');
+  loadLimits();
+}
+async function loadLimits() {
+  try {
+    const url = _userPlanOverride
+      ? '/api/limits?plan=' + encodeURIComponent(_userPlanOverride)
+      : '/api/limits';
+    const resp = await fetch(url);
+    const data = await resp.json();
+    if (data.error) return;
+    const sel = document.getElementById('plan-select');
+    if (sel && sel.value !== _userPlanOverride) sel.value = _userPlanOverride;
+    const planSrc = document.getElementById('plan-source');
+    if (planSrc) {
+      const label = (data.plan && data.plan.label) || '—';
+      const src = (data.plan && data.plan.source) || 'default';
+      planSrc.textContent = `${label} (${src})`;
+    }
+    const wk = data.weekly_all || {};
+    renderWeeklyBar(wk);
+    renderWeeklyModels(wk);
+    renderHealth(data.session_health || {});
+  } catch (e) { /* network blip */ }
+}
+function scheduleLimits() {
+  if (limitsTimer) clearInterval(limitsTimer);
+  limitsTimer = setInterval(loadLimits, 10000);
+}
+// Restore override into select before first fetch.
+(function () {
+  const sel = document.getElementById('plan-select');
+  if (sel && _userPlanOverride) sel.value = _userPlanOverride;
+})();
+loadLimits();
+scheduleLimits();
 </script>
 </body>
 </html>
@@ -1249,7 +2203,48 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.wfile.write(HTML_TEMPLATE.encode("utf-8"))
 
         elif self.path == "/api/data":
+            # Incremental scan so data stays live without manual rescan.
+            try:
+                import scanner
+                scanner.scan(db_path=DB_PATH, projects_dirs=scanner.DEFAULT_PROJECTS_DIRS, verbose=False)
+            except Exception:
+                pass
             data = get_dashboard_data()
+            body = json.dumps(data).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        elif self.path.startswith("/api/limits"):
+            override = None
+            if "?" in self.path:
+                from urllib.parse import parse_qs
+                qs = parse_qs(self.path.split("?", 1)[1])
+                override = (qs.get("plan") or [None])[0]
+            try:
+                import limits
+                if override and override in limits.PLAN_BUDGETS:
+                    os.environ["CLAUDE_USAGE_PLAN"] = override
+                data = limits.get_limits(db_path=DB_PATH)
+            except Exception as e:
+                data = {"error": str(e)}
+            body = json.dumps(data).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        elif self.path.startswith("/api/session/"):
+            sid = self.path[len("/api/session/"):].split("?")[0].split("/")[0]
+            try:
+                import scanner
+                scanner.scan(db_path=DB_PATH, projects_dirs=scanner.DEFAULT_PROJECTS_DIRS, verbose=False)
+            except Exception:
+                pass
+            data = get_session_live(sid)
             body = json.dumps(data).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -1262,6 +2257,71 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def do_POST(self):
+        if self.path == "/api/weekly/sync-reset":
+            from limits import (
+                set_weekly_anchor, clear_weekly_anchor, detect_plan,
+            )
+            length = int(self.headers.get("Content-Length", "0") or 0)
+            payload = {}
+            if length:
+                try:
+                    payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    payload = {}
+
+            if payload.get("clear"):
+                clear_weekly_anchor()
+                body = json.dumps({"cleared": True}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
+            now = datetime.now(timezone.utc)
+            anchor_at = None
+            if payload.get("anchor_at"):
+                try:
+                    anchor_at = datetime.fromisoformat(
+                        str(payload["anchor_at"]).replace("Z", "+00:00")
+                    )
+                    if anchor_at.tzinfo is None:
+                        anchor_at = anchor_at.replace(tzinfo=timezone.utc)
+                    if anchor_at > now:
+                        anchor_at = now
+                except (ValueError, AttributeError):
+                    anchor_at = None
+
+            budgets = detect_plan()["budgets"]
+            cap = budgets["weekly_all_tokens"]
+            baseline = 0
+            if payload.get("baseline_used") is not None:
+                try:
+                    baseline = max(0, int(payload["baseline_used"]))
+                except (TypeError, ValueError):
+                    baseline = 0
+            elif payload.get("percent") is not None:
+                try:
+                    baseline = max(
+                        0,
+                        int(round(float(payload["percent"]) / 100.0 * cap))
+                    )
+                except (TypeError, ValueError):
+                    baseline = 0
+
+            anchor = set_weekly_anchor(anchor_at, baseline_used=baseline)
+
+            body = json.dumps({
+                "anchor_at": anchor.isoformat(),
+                "baseline_used": baseline,
+            }).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if self.path == "/api/rescan":
             # Full rebuild: delete DB and rescan from scratch.
             # Pass DB_PATH / DEFAULT_PROJECTS_DIRS explicitly so tests that
@@ -1290,7 +2350,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 def serve(host=None, port=None):
     host = host or os.environ.get("HOST", "localhost")
     port = port or int(os.environ.get("PORT", "8080"))
-    server = HTTPServer((host, port), DashboardHandler)
+    server = ThreadingHTTPServer((host, port), DashboardHandler)
     print(f"Dashboard running at http://{host}:{port}")
     print("Press Ctrl+C to stop.")
     try:
