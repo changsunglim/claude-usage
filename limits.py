@@ -416,7 +416,7 @@ def compute_efficiency_warning(conn, now=None):
 
     session_id = row["session_id"]
     turns = conn.execute(
-        "SELECT timestamp, input_tokens, output_tokens, "
+        "SELECT timestamp, model, input_tokens, output_tokens, "
         "       cache_creation_tokens, cache_read_tokens "
         "FROM turns WHERE session_id = ? "
         "ORDER BY timestamp DESC LIMIT 10",
