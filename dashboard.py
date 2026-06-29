@@ -2183,7 +2183,7 @@ function renderWeeklyModels(wk) {
   // Under official mode the cap-relative percents are local estimates that
   // don't reconcile with Anthropic's number — show raw token split only.
   const label = isOfficial
-    ? '<span style="opacity:0.55;font-size:10px" title="Local cost-weighted token volume per model, including background haiku calls (memory, summaries, title generation). This is your local activity split, not Anthropic\\'s billed number.">local activity split: </span>'
+    ? '<span style="opacity:0.55;font-size:10px" title="Local cost-weighted token volume per model, including background haiku calls (memory, summaries, title generation). This is your local activity split, not Anthropic\'s billed number.">local activity split: </span>'
     : '';
   const parts = order
     .map(k => isOfficial
@@ -2427,6 +2427,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
 def serve(host=None, port=None):
     host = host or os.environ.get("HOST", "localhost")
     port = port or int(os.environ.get("PORT", "8080"))
+
+    # Warm the DB before accepting requests so the first page load isn't blank.
+    # Runs in a background thread so the server starts immediately.
+    import threading as _threading
+    def _startup_scan():
+        try:
+            import scanner as _scanner
+            _scanner.scan(db_path=DB_PATH, projects_dirs=_scanner.DEFAULT_PROJECTS_DIRS, verbose=False)
+        except Exception:
+            pass
+    _threading.Thread(target=_startup_scan, daemon=True).start()
+
     # Default listen backlog is 5; a page load fires several concurrent
     # fetches (/api/data, /api/limits, /api/session) so give the accept
     # queue headroom to avoid connection-refused under burst.
