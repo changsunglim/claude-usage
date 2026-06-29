@@ -2012,34 +2012,67 @@ function applyBar(cardId, used, cap, pct, footRight) {
   resetEl.textContent = footRight;
 }
 const LIMITS_MODEL_COLORS = { opus: '#d97757', sonnet: '#4f8ef7', haiku: '#4ade80', other: '#8892a4' };
-function renderWeeklyBar(wk) {
+// Neutral purple so the official fill is never mistaken for a model color
+// (green collided with haiku's swatch). Shifts to amber/red as it fills.
+function barColor(p) { return p >= 90 ? '#e5484d' : p >= 70 ? '#f5a623' : '#7c5cff'; }
+function renderWeeklyBar(wk, official) {
   const el = document.getElementById('lc-weekly');
   if (!el) return;
   const bar = el.querySelector('.lc-bar');
   const pctEl = el.querySelector('.lc-pct');
   const usedEl = el.querySelector('.lc-used');
-  const cap = wk.cap || 0;
-  const used = wk.used || 0;
   const totalPct = wk.percent == null ? 0 : wk.percent;
+  const isOfficial = (wk.source || '').startsWith('official_api');
   pctEl.textContent = totalPct.toFixed(1) + '%';
-  usedEl.innerHTML = '<strong>' + fmtTokens(used) + '</strong> / ' + fmtTokens(cap);
-  const order = ['opus', 'sonnet', 'haiku', 'other'];
-  const byTokens = wk.by_model || {};
-  const segs = order
-    .filter(k => (byTokens[k] || 0) > 0)
-    .map(k => {
-      const pct = cap > 0 ? (byTokens[k] / cap) * 100 : 0;
-      return `<div class="lc-seg" style="width:${pct}%;background:${LIMITS_MODEL_COLORS[k]}" title="${k}: ${fmtTokens(byTokens[k])} (${pct.toFixed(1)}%)"></div>`;
-    });
-  bar.innerHTML = segs.join('') || '<div class="lc-fill" style="width:0%"></div>';
+
+  const disc = el.querySelector('.lc-disclaimer');
+  const syncBtns = ['lc-weekly-sync','lc-weekly-edit','lc-weekly-clear']
+    .map(id => document.getElementById(id));
+  const srcEl = document.getElementById('lc-weekly-anchor-src');
+
+  if (isOfficial) {
+    // Ground truth from Anthropic — solid fill at the real percent. No
+    // model segments (the real per-model split isn't returned; local
+    // token math wouldn't sum to this number).
+    usedEl.innerHTML = '<strong>live</strong> from Anthropic';
+    bar.innerHTML = `<div class="lc-fill" style="width:${Math.min(100,totalPct)}%;background:${barColor(totalPct)}"></div>`;
+    if (disc) disc.style.display = 'none';
+    syncBtns.forEach(b => { if (b) b.style.display = 'none'; });
+    if (srcEl) {
+      const extras = [];
+      if (official && official.five_hour)
+        extras.push(`5h ${official.five_hour.percent.toFixed(0)}%`);
+      if (official && official.seven_day_sonnet)
+        extras.push(`Sonnet 7d ${official.seven_day_sonnet.percent.toFixed(0)}%`);
+      const stale = wk.source === 'official_api_stale' ? ' (cached)' : '';
+      srcEl.innerHTML = `<span style="color:#4ade80">●</span> Live from Anthropic${stale}`
+        + (extras.length ? ` · ${extras.join(' · ')}` : '');
+    }
+  } else {
+    // Fallback: local cost-weighted estimate with manual sync controls.
+    const cap = wk.cap || 0;
+    const used = wk.used || 0;
+    usedEl.innerHTML = '<strong>' + fmtTokens(used) + '</strong> / ' + fmtTokens(cap);
+    const order = ['opus', 'sonnet', 'haiku', 'other'];
+    const byTokens = wk.by_model || {};
+    const segs = order
+      .filter(k => (byTokens[k] || 0) > 0)
+      .map(k => {
+        const pct = cap > 0 ? (byTokens[k] / cap) * 100 : 0;
+        return `<div class="lc-seg" style="width:${pct}%;background:${LIMITS_MODEL_COLORS[k]}" title="${k}: ${fmtTokens(byTokens[k])} (${pct.toFixed(1)}%)"></div>`;
+      });
+    bar.innerHTML = segs.join('') || '<div class="lc-fill" style="width:0%"></div>';
+    if (disc) disc.style.display = '';
+    syncBtns.forEach(b => { if (b) b.style.display = ''; });
+    if (srcEl) {
+      const src = wk.anchor_source || 'auto';
+      const anchorTxt = wk.anchor_at ? new Date(wk.anchor_at).toLocaleString() : '—';
+      const reason = (official && official.reason) ? ` · live API unavailable (${official.reason})` : '';
+      srcEl.textContent = `estimate · anchor: ${anchorTxt} (${src})${reason}`;
+    }
+  }
   const resetEl = document.getElementById('lc-weekly-reset');
   if (resetEl) resetEl.textContent = wk.reset_at ? fmtCountdown(wk.reset_at) : '—';
-  const srcEl = document.getElementById('lc-weekly-anchor-src');
-  if (srcEl) {
-    const src = wk.anchor_source || 'auto';
-    const anchorTxt = wk.anchor_at ? new Date(wk.anchor_at).toLocaleString() : '—';
-    srcEl.textContent = `anchor: ${anchorTxt} (${src})`;
-  }
 }
 async function postWeekly(body) {
   const r = await fetch('/api/weekly/sync-reset', {
@@ -2114,13 +2147,25 @@ document.addEventListener('DOMContentLoaded', wireWeeklyCard);
 function renderWeeklyModels(wk) {
   const host = document.getElementById('lc-weekly-models');
   if (!host) return;
+  const isOfficial = (wk.source || '').startsWith('official_api');
   const byPct = wk.by_model_pct || {};
   const byTokens = wk.by_model || {};
-  const order = ['opus', 'sonnet', 'haiku', 'other'];
-  const parts = order
+  // Sort by token volume desc so the dominant model is always first and
+  // a small background model (haiku from memory/summarization) never
+  // shows alone or on top.
+  const order = ['opus', 'sonnet', 'haiku', 'other']
     .filter(k => (byTokens[k] || 0) > 0)
-    .map(k => `<span class="lc-model"><span class="lc-swatch" style="background:${LIMITS_MODEL_COLORS[k]}"></span>${k} ${byPct[k]||0}% · ${fmtTokens(byTokens[k]||0)}</span>`);
-  host.innerHTML = parts.join('');
+    .sort((a, b) => (byTokens[b] || 0) - (byTokens[a] || 0));
+  // Under official mode the cap-relative percents are local estimates that
+  // don't reconcile with Anthropic's number — show raw token split only.
+  const label = isOfficial
+    ? '<span style="opacity:0.55;font-size:10px" title="Local cost-weighted token volume per model, including background haiku calls (memory, summaries, title generation). This is your local activity split, not Anthropic\\'s billed number.">local activity split: </span>'
+    : '';
+  const parts = order
+    .map(k => isOfficial
+      ? `<span class="lc-model"><span class="lc-swatch" style="background:${LIMITS_MODEL_COLORS[k]}"></span>${k} ${fmtTokens(byTokens[k]||0)}</span>`
+      : `<span class="lc-model"><span class="lc-swatch" style="background:${LIMITS_MODEL_COLORS[k]}"></span>${k} ${byPct[k]||0}% · ${fmtTokens(byTokens[k]||0)}</span>`);
+  host.innerHTML = label + parts.join('');
 }
 function renderHealth(h) {
   const card = document.getElementById('lc-health');
@@ -2172,7 +2217,7 @@ async function loadLimits() {
       planSrc.textContent = `${label} (${src})`;
     }
     const wk = data.weekly_all || {};
-    renderWeeklyBar(wk);
+    renderWeeklyBar(wk, data.official || {});
     renderWeeklyModels(wk);
     renderHealth(data.session_health || {});
   } catch (e) { /* network blip */ }
@@ -2202,6 +2247,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if self.path in ("/", "/index.html"):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            # JS is inlined in the doc — without no-store the browser serves
+            # a stale page after every code change (caused "still green",
+            # "haiku only" confusion). Force a fresh fetch each load.
+            self.send_header("Cache-Control", "no-store, must-revalidate")
             self.end_headers()
             self.wfile.write(HTML_TEMPLATE.encode("utf-8"))
 

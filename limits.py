@@ -19,8 +19,10 @@ users.
 
 import json
 import os
+import ssl
 import subprocess
 import sqlite3
+import threading
 import time
 import urllib.request
 import urllib.error
@@ -32,6 +34,15 @@ PLAN_CACHE_PATH = Path.home() / ".claude" / "usage-plan-cache.json"
 PLAN_CACHE_TTL_SECONDS = 24 * 3600
 WEEKLY_ANCHOR_PATH = Path.home() / ".claude" / "usage-weekly-anchor.json"
 WEEKLY_WINDOW = timedelta(days=7)
+
+# Anthropic's own usage endpoint — same source `claude /usage` and the
+# ClaudeKarma browser extension read. Returns ground-truth utilization
+# percentages and reset times for the 5-hour and 7-day windows, so we no
+# longer have to approximate them from local JSONL cost-weighting.
+OFFICIAL_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+OFFICIAL_USAGE_TTL_SECONDS = 60  # don't hammer the API on every 10s poll
+_OFFICIAL_CACHE = {"data": None, "at": 0.0}
+_OFFICIAL_LOCK = threading.Lock()
 
 PLAN_BUDGETS = {
     "pro":    {"label": "Pro",     "weekly_all_tokens": 23_000_000},
@@ -56,6 +67,29 @@ DEFAULT_PLAN = "pro"
 
 
 # ── Plan detection ─────────────────────────────────────────────────────────
+
+_SSL_CTX = None
+
+
+def _ssl_context():
+    """SSL context that actually verifies api.anthropic.com.
+
+    python.org / pyenv builds don't trust the macOS system keychain, so a
+    plain urlopen raises CERTIFICATE_VERIFY_FAILED (which is why earlier
+    API probes silently returned None). Prefer certifi's CA bundle; fall
+    back to the stdlib default. Verification is never disabled — this hits
+    an OAuth-bearing endpoint.
+    """
+    global _SSL_CTX
+    if _SSL_CTX is not None:
+        return _SSL_CTX
+    try:
+        import certifi
+        _SSL_CTX = ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        _SSL_CTX = ssl.create_default_context()
+    return _SSL_CTX
+
 
 def _read_keychain_oauth():
     """Read Claude Code OAuth credentials from macOS keychain."""
@@ -90,9 +124,12 @@ def _fetch_plan_from_api(access_token, timeout=4):
     for url in candidates:
         try:
             req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with urllib.request.urlopen(
+                req, timeout=timeout, context=_ssl_context()
+            ) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
             for path in (
+                ("organization", "rate_limit_tier"),
                 ("organization", "organization_type"),
                 ("subscription", "tier"),
                 ("plan",),
@@ -192,6 +229,110 @@ def _plan_response(plan, source, raw=None):
         "detected_raw": raw,
         "budgets": b,
     }
+
+
+# ── Official usage (Anthropic ground truth) ────────────────────────────────
+
+def _parse_window(node):
+    """Normalize one usage window (five_hour / seven_day / *_sonnet) into
+    {percent, reset_at, severity}. Returns None if the node is absent."""
+    if not isinstance(node, dict):
+        return None
+    util = node.get("utilization")
+    if util is None and "percent" in node:
+        util = node.get("percent")
+    if util is None:
+        return None
+    return {
+        "percent": round(float(util), 1),
+        "reset_at": node.get("resets_at") or node.get("reset_at"),
+        "severity": node.get("severity"),
+    }
+
+
+def _fetch_official_usage_uncached(timeout=8):
+    """Hit Anthropic's real usage endpoint with the Claude Code OAuth token.
+
+    Returns a dict with `available` plus normalized 5h / 7-day / scoped
+    windows, or {available: False, reason: ...} on any failure (no token,
+    expired token, network error, schema drift). Callers fall back to the
+    local JSONL estimate when unavailable.
+    """
+    creds = _read_keychain_oauth()
+    token = (creds or {}).get("claudeAiOauth", {}).get("accessToken") if creds else None
+    if not token:
+        return {"available": False, "reason": "no_oauth_token"}
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "anthropic-beta": "oauth-2025-04-20",
+        "Content-Type": "application/json",
+        "User-Agent": "claude-usage-dashboard/1.0",
+    }
+    try:
+        req = urllib.request.Request(OFFICIAL_USAGE_URL, headers=headers)
+        with urllib.request.urlopen(
+            req, timeout=timeout, context=_ssl_context()
+        ) as resp:
+            raw = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        reason = "token_expired" if e.code in (401, 403) else f"http_{e.code}"
+        return {"available": False, "reason": reason}
+    except (urllib.error.URLError, json.JSONDecodeError,
+            TimeoutError, OSError) as e:
+        return {"available": False, "reason": f"fetch_error:{type(e).__name__}"}
+
+    five_hour = _parse_window(raw.get("five_hour"))
+    seven_day = _parse_window(raw.get("seven_day"))
+    sonnet = _parse_window(raw.get("seven_day_sonnet"))
+    opus = _parse_window(raw.get("seven_day_opus"))
+
+    # Fallback: pull from the typed `limits` array if top-level keys drift.
+    if seven_day is None or five_hour is None:
+        for lim in raw.get("limits") or []:
+            kind = lim.get("kind")
+            parsed = _parse_window(lim)
+            if kind == "weekly_all" and seven_day is None:
+                seven_day = parsed
+            elif kind == "session" and five_hour is None:
+                five_hour = parsed
+
+    if seven_day is None:
+        return {"available": False, "reason": "no_weekly_in_response"}
+
+    return {
+        "available": True,
+        "five_hour": five_hour,
+        "seven_day": seven_day,
+        "seven_day_sonnet": sonnet,
+        "seven_day_opus": opus,
+    }
+
+
+def fetch_official_usage(force=False):
+    """Cached wrapper around the official usage endpoint (60s TTL).
+
+    The dashboard polls /api/limits every 10s; without caching that would
+    fire 6 API calls/min. One process-wide cache, guarded by a lock so the
+    ThreadingHTTPServer's worker threads don't stampede the endpoint.
+    """
+    with _OFFICIAL_LOCK:
+        now = time.time()
+        cached = _OFFICIAL_CACHE["data"]
+        fresh = cached and (now - _OFFICIAL_CACHE["at"]) < OFFICIAL_USAGE_TTL_SECONDS
+        if fresh and not force:
+            return cached
+        data = _fetch_official_usage_uncached()
+        # Keep serving a previously-good payload if a refresh transiently
+        # fails — better a 60s-stale real number than dropping to estimate.
+        if not data.get("available") and cached and cached.get("available"):
+            stale = dict(cached)
+            stale["stale"] = True
+            stale["refresh_reason"] = data.get("reason")
+            return stale
+        _OFFICIAL_CACHE["data"] = data
+        _OFFICIAL_CACHE["at"] = now
+        return data
 
 
 # ── Window calculations ────────────────────────────────────────────────────
@@ -520,22 +661,41 @@ def get_limits(db_path=DB_PATH):
     weekly_cap = budgets["weekly_all_tokens"]
     weekly_used = weekly["total"]
 
+    weekly_all = {
+        "used": weekly_used,
+        "cap": weekly_cap,
+        "remaining": max(0, weekly_cap - weekly_used),
+        "percent": pct(weekly_used, weekly_cap),
+        "by_model": weekly["by_model"],
+        "by_model_pct": {
+            k: pct(v, weekly_cap) for k, v in weekly["by_model"].items()
+        },
+        "anchor_at": weekly["anchor_at"],
+        "anchor_source": weekly["anchor_source"],
+        "baseline_used": weekly.get("baseline_used", 0),
+        "reset_at": weekly["reset_at"],
+        "source": "local_estimate",
+    }
+
+    # Prefer Anthropic's ground-truth number when the OAuth endpoint
+    # answers. The local cost-weighted estimate stays as `local_percent`
+    # for comparison and as the fallback when offline / token expired.
+    official = fetch_official_usage()
+    if official.get("available") and official.get("seven_day"):
+        sd = official["seven_day"]
+        weekly_all["local_percent"] = weekly_all["percent"]
+        weekly_all["percent"] = sd["percent"]
+        if sd.get("reset_at"):
+            weekly_all["reset_at"] = sd["reset_at"]
+        weekly_all["severity"] = sd.get("severity")
+        weekly_all["source"] = "official_api"
+        if official.get("stale"):
+            weekly_all["source"] = "official_api_stale"
+
     return {
         "plan": plan_info,
-        "weekly_all": {
-            "used": weekly_used,
-            "cap": weekly_cap,
-            "remaining": max(0, weekly_cap - weekly_used),
-            "percent": pct(weekly_used, weekly_cap),
-            "by_model": weekly["by_model"],
-            "by_model_pct": {
-                k: pct(v, weekly_cap) for k, v in weekly["by_model"].items()
-            },
-            "anchor_at": weekly["anchor_at"],
-            "anchor_source": weekly["anchor_source"],
-            "baseline_used": weekly.get("baseline_used", 0),
-            "reset_at": weekly["reset_at"],
-        },
+        "weekly_all": weekly_all,
+        "official": official,
         "session_health": warning,
         "weekly_claude_design": {
             "trackable": False,
