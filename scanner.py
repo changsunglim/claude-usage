@@ -33,8 +33,14 @@ def get_db(db_path=DB_PATH):
     # Ensure the parent directory exists — on a fresh install or CI runner
     # ~/.claude may not yet exist, and sqlite3.connect needs the parent dir.
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=10)
     conn.row_factory = sqlite3.Row
+    # The dashboard is a ThreadingHTTPServer that re-scans (writes) on every
+    # /api/data poll. With the default rollback journal, overlapping
+    # reads/writes throw "database is locked". WAL lets readers run during a
+    # write; busy_timeout makes any contender wait instead of erroring.
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=10000")
     return conn
 
 

@@ -7,6 +7,7 @@ import os
 import re
 import glob
 import sqlite3
+import threading
 from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -119,12 +120,34 @@ def get_session_titles(session_ids):
     return out
 
 
+# Only one scan may write the DB at a time. ThreadingHTTPServer can fire
+# several /api/data + /api/session polls concurrently; without this they
+# launch overlapping write-scans and collide ("database is locked").
+_SCAN_LOCK = threading.Lock()
+
+
+def _safe_rescan():
+    """Incremental rescan, serialized and never fatal to the request."""
+    if not _SCAN_LOCK.acquire(blocking=False):
+        return  # a scan is already running — its result will be read below
+    try:
+        import scanner
+        scanner.scan(db_path=DB_PATH,
+                     projects_dirs=scanner.DEFAULT_PROJECTS_DIRS,
+                     verbose=False)
+    except Exception:
+        pass
+    finally:
+        _SCAN_LOCK.release()
+
+
 def get_dashboard_data(db_path=DB_PATH):
     if not db_path.exists():
         return {"error": "Database not found. Run: python cli.py scan"}
 
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=10)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=10000")
 
     # ── All models (for filter UI) ────────────────────────────────────────────
     model_rows = conn.execute("""
@@ -363,8 +386,9 @@ def parse_session_messages(jsonl_path):
 def get_session_live(session_id, db_path=DB_PATH):
     if not db_path.exists():
         return {"error": "Database not found"}
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=10)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=10000")
     # Resolve full id from prefix
     row = conn.execute(
         "SELECT session_id, project_name, model, turn_count, first_timestamp, last_timestamp, "
@@ -2256,11 +2280,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         elif self.path == "/api/data":
             # Incremental scan so data stays live without manual rescan.
-            try:
-                import scanner
-                scanner.scan(db_path=DB_PATH, projects_dirs=scanner.DEFAULT_PROJECTS_DIRS, verbose=False)
-            except Exception:
-                pass
+            _safe_rescan()
             data = get_dashboard_data()
             body = json.dumps(data).encode("utf-8")
             self.send_response(200)
@@ -2291,11 +2311,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         elif self.path.startswith("/api/session/"):
             sid = self.path[len("/api/session/"):].split("?")[0].split("/")[0]
-            try:
-                import scanner
-                scanner.scan(db_path=DB_PATH, projects_dirs=scanner.DEFAULT_PROJECTS_DIRS, verbose=False)
-            except Exception:
-                pass
+            _safe_rescan()
             data = get_session_live(sid)
             body = json.dumps(data).encode("utf-8")
             self.send_response(200)
@@ -2387,13 +2403,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
             # frozen at def time and would otherwise target the real paths).
             import scanner
             db_path = DB_PATH
-            if db_path.exists():
-                db_path.unlink()
-            result = scanner.scan(
-                db_path=db_path,
-                projects_dirs=scanner.DEFAULT_PROJECTS_DIRS,
-                verbose=False,
-            )
+            # Block on the scan lock: a full delete+rebuild must never race
+            # an in-flight incremental scan or a reader mid-query.
+            with _SCAN_LOCK:
+                if db_path.exists():
+                    db_path.unlink()
+                result = scanner.scan(
+                    db_path=db_path,
+                    projects_dirs=scanner.DEFAULT_PROJECTS_DIRS,
+                    verbose=False,
+                )
             body = json.dumps(result).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -2408,6 +2427,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
 def serve(host=None, port=None):
     host = host or os.environ.get("HOST", "localhost")
     port = port or int(os.environ.get("PORT", "8080"))
+    # Default listen backlog is 5; a page load fires several concurrent
+    # fetches (/api/data, /api/limits, /api/session) so give the accept
+    # queue headroom to avoid connection-refused under burst.
+    ThreadingHTTPServer.request_queue_size = 128
     server = ThreadingHTTPServer((host, port), DashboardHandler)
     print(f"Dashboard running at http://{host}:{port}")
     print("Press Ctrl+C to stop.")

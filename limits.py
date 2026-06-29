@@ -338,8 +338,9 @@ def fetch_official_usage(force=False):
 # ── Window calculations ────────────────────────────────────────────────────
 
 def _connect(db_path=DB_PATH):
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=10)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=10000")
     return conn
 
 
